@@ -1,0 +1,428 @@
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 945ca0e..de7df53 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -291,6 +291,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
++  # Blink (GPU-resident decode loop): the device runtime's cudaGraphLaunch needs relocatable device code.  Its own static
++  # library with the device link resolved inside it, so no other target changes how it is compiled.
++  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
++    add_library(strata_blink STATIC src/core/blink.cu)
++    target_include_directories(strata_blink PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
++    set_target_properties(strata_blink PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
++                                                  POSITION_INDEPENDENT_CODE ON)
++    find_library(STRATA_CUDADEVRT cudadevrt HINTS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
++    target_link_libraries(strata_blink PUBLIC ${_strata_gpu_runtime_target} ${STRATA_CUDADEVRT})
++    target_link_libraries(strata_engine PUBLIC strata_blink)
++  endif()
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
+     target_include_directories(host_graph_launch_test PRIVATE include)
+diff --git a/include/strata/core/blink.hpp b/include/strata/core/blink.hpp
+new file mode 100644
+index 0000000..5dcee96
+--- /dev/null
++++ b/include/strata/core/blink.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++// strata::blink - a GPU-resident decode loop after Blink (arXiv 2604.07609), step by step.
++//
++// M1 (STRATA_BLINK_DEVLAUNCH=1): the verify / commit / MTP graphs are instantiated for device launch and every launch of
++// them goes through a one-node launcher graph whose kernel fires the real graph from the GPU (fire-and-forget). The host
++// still drives the loop and syncs exactly as before (a stream sync covers the fire-and-forget child); this proves the
++// graphs run, bit for bit, when the GPU launches them.  Off (the default): plain cudaGraphInstantiate / cudaGraphLaunch.
++#include <cuda_runtime.h>
++
++namespace strata::blink {
++
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
++inline bool devlaunch_on() { return false; }
++inline cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags) {
++    return cudaGraphInstantiate(ex, g, flags);
++}
++inline cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s) { return cudaGraphLaunch(ex, s); }
++#else
++/// STRATA_BLINK_DEVLAUNCH=1
++bool devlaunch_on();
++/// cudaGraphInstantiate, plus cudaGraphInstantiateFlagDeviceLaunch and registration when devlaunch_on()
++cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags);
++/// a registered graph: launched from the device through its launcher; any other graph: cudaGraphLaunch
++cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s);
++#endif
++
++}  // namespace strata::blink
+diff --git a/include/strata/core/host_graph_launch.hpp b/include/strata/core/host_graph_launch.hpp
+index 2993997..405227b 100644
+--- a/include/strata/core/host_graph_launch.hpp
++++ b/include/strata/core/host_graph_launch.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "strata/core/blink.hpp"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <functional>
+@@ -21,12 +22,12 @@ public:
+             pending_.store(true);
+             worker_ = std::thread([this, graph, device] {
+                 auto error = cudaSetDevice(device);
+-                if (error == cudaSuccess) error = cudaGraphLaunch(graph, stream_);
++                if (error == cudaSuccess) error = strata::blink::launch(graph, stream_);
+                 error_ = error;
+                 pending_.store(false, std::memory_order_release);
+             });
+         } else {
+-            error_ = cudaGraphLaunch(graph, stream_);
++            error_ = strata::blink::launch(graph, stream_);
+         }
+     }
+     HostGraphLaunch(const HostGraphLaunch&) = delete;
+diff --git a/src/core/blink.cu b/src/core/blink.cu
+new file mode 100644
+index 0000000..930eed3
+--- /dev/null
++++ b/src/core/blink.cu
+@@ -0,0 +1,125 @@
++// src/core/blink.cu - see include/strata/core/blink.hpp.  Built as its own static library with relocatable device code
++// (the device runtime's cudaGraphLaunch), so no other Strata target changes how it is compiled.
++#include "strata/core/blink.hpp"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++
++namespace strata::blink {
++namespace {
++
++// Fires `g` from the device.  A failure is recorded (first error wins) for the host to report at its next launch.
++__global__ void ff_launch(cudaGraphExec_t g, int* err) {
++    if (threadIdx.x != 0 || blockIdx.x != 0) return;
++    const cudaError_t e = cudaGraphLaunch(g, cudaStreamGraphFireAndForget);
++    if (e != cudaSuccess) atomicCAS(err, 0, (int) e);
++}
++
++struct Registry {
++    std::mutex mu;
++    std::unordered_set<cudaGraphExec_t> device;                      // instantiated for device launch
++    std::unordered_set<cudaGraphExec_t> uploaded;
++    std::unordered_map<cudaGraphExec_t, cudaGraphExec_t> launcher;   // child -> its launcher graph
++    int* h_err = nullptr;                                            // mapped, portable
++    int* d_err = nullptr;
++    std::atomic<long long> launches{0};
++};
++Registry& reg() {
++    static Registry r;
++    return r;
++}
++
++bool ensure_err(Registry& r) {
++    if (r.h_err != nullptr) return true;
++    if (cudaHostAlloc((void**) &r.h_err, sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
++    *(volatile int*) r.h_err = 0;
++    return cudaHostGetDevicePointer((void**) &r.d_err, r.h_err, 0) == cudaSuccess;
++}
++
++cudaError_t make_launcher(Registry& r, cudaGraphExec_t child, cudaGraphExec_t* out) {
++    cudaGraph_t g = nullptr;
++    cudaError_t e = cudaGraphCreate(&g, 0);
++    if (e != cudaSuccess) return e;
++    cudaKernelNodeParams kp{};
++    void* args[] = {&child, &r.d_err};
++    kp.func = (void*) ff_launch;
++    kp.gridDim = dim3(1);
++    kp.blockDim = dim3(32);
++    kp.kernelParams = args;
++    cudaGraphNode_t n = nullptr;
++    e = cudaGraphAddKernelNode(&n, g, nullptr, 0, &kp);
++    if (e == cudaSuccess) e = cudaGraphInstantiate(out, g, 0);
++    cudaGraphDestroy(g);
++    return e;
++}
++
++}  // namespace
++
++bool devlaunch_on() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_BLINK_DEVLAUNCH");
++        const bool o = v != nullptr && std::atoi(v) != 0;
++        if (o) std::fprintf(stderr, "strata blink: M1 on - verify / commit / MTP graphs are launched from the GPU (fire-and-forget)\n");
++        return o;
++    }();
++    return on;
++}
++
++cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags) {
++    if (!devlaunch_on()) return cudaGraphInstantiate(ex, g, flags);
++    const cudaError_t e = cudaGraphInstantiate(ex, g, flags | cudaGraphInstantiateFlagDeviceLaunch);
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "strata blink: instantiate for device launch failed: %s\n", cudaGetErrorString(e));
++        return e;
++    }
++    Registry& r = reg();
++    std::lock_guard<std::mutex> lk(r.mu);
++    r.device.insert(*ex);
++    r.uploaded.erase(*ex);   // a reused handle value is a new graph
++    r.launcher.erase(*ex);
++    return e;
++}
++
++cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s) {
++    if (!devlaunch_on()) return cudaGraphLaunch(ex, s);
++    // the graph's own flags, not a registry: Strata destroys and recaptures graphs, and a handle value can come back
++    unsigned long long fl = 0;
++    if (cudaGraphExecGetFlags(ex, &fl) != cudaSuccess || (fl & cudaGraphInstantiateFlagDeviceLaunch) == 0)
++        return cudaGraphLaunch(ex, s);   // not instantiated for device launch: as before
++    Registry& r = reg();
++    cudaGraphExec_t le = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(r.mu);
++        if (!ensure_err(r)) return cudaErrorMemoryAllocation;
++        if (const int de = *(volatile int*) r.h_err; de != 0) {
++            std::fprintf(stderr, "strata blink: an earlier device-side graph launch failed: %s\n",
++                         cudaGetErrorString((cudaError_t) de));
++            return (cudaError_t) de;
++        }
++        if (r.uploaded.insert(ex).second) {
++            const cudaError_t ue = cudaGraphUpload(ex, s);   // a device launch needs the graph on the device first
++            if (ue != cudaSuccess) {
++                r.uploaded.erase(ex);
++                return ue;
++            }
++        }
++        auto it = r.launcher.find(ex);
++        if (it == r.launcher.end()) {
++            const cudaError_t me = make_launcher(r, ex, &le);
++            if (me != cudaSuccess) return me;
++            r.launcher.emplace(ex, le);
++        } else {
++            le = it->second;
++        }
++    }
++    const long long n = ++r.launches;
++    if (n == 1 || n == 1000 || n == 100000)
++        std::fprintf(stderr, "strata blink: %lld device-side graph launches so far\n", n);
++    return cudaGraphLaunch(le, s);
++}
++
++}  // namespace strata::blink
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index d6d99e2..dcd7768 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1,4 +1,5 @@
+ // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
++#include "strata/core/blink.hpp"
+ #include "strata/core/mtp.hpp"
+ #include "strata/core/pin_budget.hpp"
+ #include "strata/kernels/qsa_prompt_attn.hpp"
+@@ -1418,7 +1419,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
+         return false;
+     }
+     cudaGraphExec_t got = nullptr;   // (a failed instantiate leaves nothing in the member)
+-    const cudaError_t ie = ce != cudaSuccess ? ce : cudaGraphInstantiate(&got, graph, 0);
++    const cudaError_t ie = ce != cudaSuccess ? ce : strata::blink::instantiate(&got, graph, 0);
+     if (ie != cudaSuccess) {
+         if (graph) cudaGraphDestroy(graph);
+         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ie);   // the status that failed
+@@ -1647,7 +1648,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+                 cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                                 cs_) != cudaSuccess ||
+-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
++                strata::blink::launch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
+                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1679,7 +1680,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+         }
+         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                             cs_) != cudaSuccess ||
+-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
++            strata::blink::launch(prefill_exec_[T], cs_) != cudaSuccess ||
+             cudaStreamSynchronize(cs_) != cudaSuccess) {
+             err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+@@ -1795,12 +1796,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+ 
+     int n = 0;
+     if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (strata::blink::launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+         for (int j = 1; j < max_steps; ++j) {
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (strata::blink::launch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1836,7 +1837,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         if (dt) g_dt.pre_ms += hms(t0);
+         if (dt) cudaEventRecord(g_dt.eb[0], cs_);
+         Clock::time_point tl = Clock::now();
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (strata::blink::launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+@@ -1865,7 +1866,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : pj >= min_p); ++j) {
+             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
+             tl = Clock::now();
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (strata::blink::launch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -2002,10 +2003,10 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!stage_source_R(T, err)) return false;
+     chain_early_ = std::max(0, std::min(n_early, n_out));
+-    bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
++    bool ok = strata::blink::launch(round_exec_[T], cs_) == cudaSuccess;
+     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
+     for (int j = 1; ok && j < n_out; ++j) {
+-        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
++        ok = strata::blink::launch(step_exec_[j], cs_) == cudaSuccess;
+         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
+     }
+     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 3f1bacd..e2bd10b 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -10,6 +10,7 @@
+ #include "strata/core/defaults_026.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/blink.hpp"
+ #include "strata/core/window_evict.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/pin_budget.hpp"
+@@ -3230,7 +3231,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
+     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
++    const cudaError_t le = strata::blink::launch(exec_t, cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+@@ -3387,7 +3388,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         }
+ #else
+         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
++        const cudaError_t le = strata::blink::launch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+ #endif
+         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+         graph_launched = true;
+@@ -3920,7 +3921,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
+                              (long long) ct.n);
+         }
+         if (ct.on) cudaEventRecord(ct.b, cs_);
+-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
++        const cudaError_t le = strata::blink::launch(commit_exec_, cs_);
+         if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
+         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+@@ -4354,8 +4355,8 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
+     staging_deferred_ = false;
+     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
+     const auto key = bkey(rows, S, hbase);
+-    cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
+-    if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
++    cudaError_t le = strata::blink::launch(exec_bm_[key], cs_);
++    if (le == cudaSuccess) le = strata::blink::launch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     b_k_ = 0;
+@@ -4384,7 +4385,7 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
+         for (int64_t j = 0; j < max_t_; ++j) c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(it->second, cs_);
++    const cudaError_t le = strata::blink::launch(it->second, cs_);
+     if (le != cudaSuccess) { err = std::string("verify: deferred commit launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens), the accepted rows only
+@@ -4553,14 +4554,14 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
+     // capture() reads as "captured" when it is not null)
+     capture_oom_ = false;
+     cudaGraphExec_t got = nullptr;
+-    cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
++    cudaError_t ie = strata::blink::instantiate(&got, graph, flags);
+     int freed = 0;
+     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
+         (void) cudaGetLastError();
+         if (!evict_batch_graph(key, evicted, err)) return false;
+         if (evicted) {
+             ++freed;
+-            ie = cudaGraphInstantiate(&got, graph, flags);
++            ie = strata::blink::instantiate(&got, graph, flags);
+         }
+     }
+     if (freed > 0)
+@@ -4573,7 +4574,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
+         if (!evict_window_graph(keep_t, evicted, err)) return false;
+         if (evicted) {
+             ++freed_sizes;
+-            ie = cudaGraphInstantiate(&got, graph, flags);
++            ie = strata::blink::instantiate(&got, graph, flags);
+         }
+     }
+     if (freed_sizes > 0)
+@@ -4728,7 +4729,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+     const ModelGeometry& g = *g_;
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+-    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
++    const cudaError_t le = strata::blink::launch(exec_bm_[bkey(rows, S, 0)], cs_);
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     volatile uint32_t* const seq = h_seq_;
+@@ -4861,7 +4862,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
+-        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
++        const cudaError_t le = strata::blink::launch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+         const cudaError_t se = cudaStreamSynchronize(cs_);
+         if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+@@ -4967,9 +4968,9 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
+     for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
++    cudaError_t le = strata::blink::launch(exec_bm_[bkey(rows, S, base)], cs_);
+     if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
++        le = strata::blink::launch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+@@ -5283,7 +5284,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+     ms_host += ms_since(t0);
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
++    const cudaError_t le = strata::blink::launch(exec_[sl][T], cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+@@ -5448,7 +5449,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+     h_commit_[1] = n_keep - 1;
+     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
++    const cudaError_t le = strata::blink::launch(commit_exec_, cs_);
+     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+     if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+     (void) cudaStreamQuery(cs_);

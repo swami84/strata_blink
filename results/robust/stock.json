@@ -1,0 +1,13 @@
+{
+ "turns": [
+  "The sky appears blue primarily due to a phenomenon known as Rayleigh scattering. Sunlight, which looks white, is actually composed of all the colors of the visible spectrum. When this light enters Earth\u2019s atmosphere, it interacts with gas molecules and tiny particles. Shorter wavelengths, such as blue and violet, scatter much more strongly than longer wavelengths like red or orange. Although violet light scatters even more efficiently than blue, our eyes are less sensitive to violet, and some of it is absorbed by the upper atmosphere. Consequently, the scattered blue light dominates what we see when looking at the sky away from the sun. This effect is most pronounced on clear days when the air is clean. During sunrise or sunset, sunlight travels through a thicker layer of atmosphere, scattering shorter wavelengths out of view and allowing longer red and orange wavelengths to reach our eyes, creating vibrant hues.",
+  "Sunlight looks white, but it\u2019s actually made of many colors. When sunlight hits the air around Earth, tiny bits in the sky bounce the light around. Blue light bounces more than other colors because it\u2019s smaller and lighter. So, when you look up, you see lots of blue bouncing back to your eyes! It\u2019s like a giant game of tag where blue is the best at hiding and showing up everywhere. That\u2019s why the sky looks so pretty and blue during the day.",
+  "Sunlight scatters light,\nBlue bounces back to our eyes,\nSky wears a blue coat."
+ ],
+ "cached": [
+  0,
+  200,
+  331
+ ],
+ "after_cancel": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29"
+}

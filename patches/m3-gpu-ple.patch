@@ -1,0 +1,1797 @@
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 945ca0e..de7df53 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -291,6 +291,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
++  # Blink (GPU-resident decode loop): the device runtime's cudaGraphLaunch needs relocatable device code.  Its own static
++  # library with the device link resolved inside it, so no other target changes how it is compiled.
++  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
++    add_library(strata_blink STATIC src/core/blink.cu)
++    target_include_directories(strata_blink PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
++    set_target_properties(strata_blink PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
++                                                  POSITION_INDEPENDENT_CODE ON)
++    find_library(STRATA_CUDADEVRT cudadevrt HINTS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
++    target_link_libraries(strata_blink PUBLIC ${_strata_gpu_runtime_target} ${STRATA_CUDADEVRT})
++    target_link_libraries(strata_engine PUBLIC strata_blink)
++  endif()
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
+     target_include_directories(host_graph_launch_test PRIVATE include)
+diff --git a/include/strata/core/blink.hpp b/include/strata/core/blink.hpp
+new file mode 100644
+index 0000000..5727473
+--- /dev/null
++++ b/include/strata/core/blink.hpp
+@@ -0,0 +1,188 @@
++#pragma once
++// strata::blink - a GPU-resident decode loop after Blink (arXiv 2604.07609), extended to a two-GPU layer split.
++//
++// M1 (STRATA_BLINK_DEVLAUNCH=1): the verify / commit / MTP graphs are instantiated for device launch and every launch of
++//   them goes through a one-node launcher graph whose kernel fires the real graph from the GPU.  The host still drives the
++//   loop and syncs as before (a stream sync covers the fire-and-forget child).
++// M2 (STRATA_BLINK=1, implies M1's instantiation): the decode loop itself runs on the GPUs.  One persistent scheduler per
++//   GPU (a one-warp kernel in a device-launchable graph, tail-relaunched before the 120 fire-and-forget launches a graph
++//   execution may make):
++//     GPU1 (the last stage: head + MTP drafter): picks the window (the --spec-min-p rule), stages its rows, runs its half,
++//       accepts the drafts, commits, publishes the tokens to a ring in mapped host memory, drafts the next window.
++//     GPU0 (the first stage): waits for each window, stages its rows, runs its half, commits.
++//   The two talk through a control block in mapped pinned host memory (no peer access on these cards); every graph the
++//   loop launches ends with a counter bump (capture_done) so the scheduler knows when it has finished.  The host only
++//   prints the ring's tokens, passes a STOP on, and (M2) serves the first stage's PLE rows.
++// Off (the default): plain cudaGraphInstantiate / cudaGraphLaunch, nothing else changes.
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <string>
++
++namespace strata::blink {
++
++constexpr int kMaxT = 8;          // the build's widest verify window ("verify / batch windows hold up to 8 rows")
++constexpr int kRing = 1 << 16;    // emitted tokens in flight between the GPU and the host
++constexpr int kMaxEos = 8;
++constexpr int kFFLimit = 120;     // CUDA: fire-and-forget launches one graph execution may make
++constexpr int kPenCap = 256;      // the longest penalty window the loop keeps (penalty_last_n)
++
++/// One Verifier (a stage of the layer split): where its window graph reads its per-window inputs, and its graphs.
++struct StageDesc {
++    int32_t* tok = nullptr;       // mapped: T
++    int32_t* step = nullptr;      // mapped: T * 4 (pos, n_kv, n_bid, width)
++    int32_t* pos = nullptr;       // mapped: q heads, then kv heads, then indexer heads, max_t rows each
++    uint32_t* seq = nullptr;
++    uint32_t* flag = nullptr;     // the PLE flag (the first stage's layer 1 waits for it)
++    uint32_t* flagA = nullptr;
++    uint32_t* flagB = nullptr;
++    uint32_t* hflag_out = nullptr;   // the overlapped split's hand-off flag (may be null)
++    uint32_t* herr = nullptr;        // (may be null)
++    uint32_t* hdrop = nullptr;       // (may be null)
++    int32_t* commit = nullptr;    // mapped: [n_keep, n_keep - 1, pos_0 .. pos_{max_t-1}]
++    int32_t* out = nullptr;       // mapped: the argmax per row (last stage)
++    uint32_t* nf = nullptr;       // mapped: non-finite flags, kVerifyMaxT * nf_blocks (last stage with the guard on)
++    int nf_blocks = 0;
++    uint32_t* plan_err = nullptr;
++    int n_head = 0, n_head_kv = 0, idx_q_heads = 0, idx_block = 1, idx_top_k = 0, max_t = 0;
++    int self_commit_t1 = 0;       // a one-row window advanced the state itself: no commit graph
++    cudaGraphExec_t win[kMaxT + 1] = {};   // win[T]
++    cudaGraphExec_t commit_exec = nullptr;
++    unsigned* done = nullptr;     // this device's counter, bumped at the end of every loop graph
++    int device = -1;
++    // greedy with repetition penalties (last stage): the penalised pick runs again after the window, over `hist`
++    cudaGraphExec_t samp[kMaxT + 1] = {};
++    int32_t* hist = nullptr;      // device: T rows of hist_len slots, most recent last, -1 in the unused front slots
++    int hist_len = 0;
++    // the first stage's PLE rows: 0 none (the flag is raised at once), 1 the host gathers them (M2), 2 the GPU does (M3)
++    int ple_mode = 0;
++    const uint8_t* ple_table = nullptr;   // M3: the IQ4_NL table in registered host memory (the device's address)
++    unsigned long long ple_rows = 0;
++    float* ple_out = nullptr;             // M3: the stage's mapped PLE input (T x 16 rows x 160 floats)
++    unsigned long long ple_mult[3] = {}, ple_vocab[16] = {}, ple_offset[16] = {};
++};
++
++/// The MTP drafter (on the last stage's GPU).
++struct MtpDesc {
++    int32_t* tok = nullptr;
++    int32_t* step = nullptr;
++    int32_t* pos = nullptr;
++    int32_t* out = nullptr;
++    int32_t* row = nullptr;
++    int32_t* force = nullptr;     // (may be null)
++    float* prob = nullptr;
++    int n_head = 0, max_t = 0, max_drafts = 0, catchup_all = 0;
++    long long max_cells = 0;
++    cudaGraphExec_t round[kMaxT + 1] = {};   // round[T]
++    cudaGraphExec_t step_g[kMaxT + 1] = {};  // step_g[j]
++    unsigned* done = nullptr;
++    int device = -1;
++};
++
++enum Finish : int { kRunning = 0, kLength = 1, kStop = 2, kCancel = 3, kNonfinite = 4, kContext = 5, kError = 9 };
++
++/// Mapped pinned host memory (portable): the host and both GPUs.  The GPUs read and write it with volatile accesses and
++/// system fences; the host the same way (volatile, seq_cst fences).
++struct Ctl {
++    // the request (the host, before start)
++    long long p0, max_new, produced0, max_context;
++    int x0, S_mtp, n_eos, first_window;
++    int eos[kMaxEos];
++    float min_p;
++    int ple_prev0[2];
++    // GPU1 -> GPU0: the window
++    int win_seq, T;
++    long long p;
++    int tokens[kMaxT];
++    // GPU0 -> GPU1: its half of window win_seq is done / its commit is done
++    int s0_done, s0_commit_done;
++    // GPU1 -> GPU0
++    int commit_seq, n_keep, exit_req;
++    // GPU0 -> host -> the first stage's graph (M2): the PLE rows of a window
++    int ple_seq, ple_T, ple_done;
++    int ple_tokens[kMaxT];
++    int ple_prev[2];
++    // host -> GPU
++    int stop;
++    long long consumed;           // ring entries the host has printed
++    // GPU -> host
++    long long produced;           // ring entries published
++    int finished;                 // a Finish value once GPU1 is done
++    int err, err_where;
++    long long p_end, windows, offered, accepted, launches1, launches0, relaunches1, relaunches0;
++    int x_end, last_T, last_a;
++    long long last_p;
++    int last_window[kMaxT];
++    int ple_prev_end[2];
++    int ring[kRing];
++};
++
++/// What generate.cpp hands the loop.
++struct LoopArgs {
++    StageDesc s0, s1;
++    MtpDesc mtp;
++    int dev0 = 0, dev1 = 1;
++    long long p0 = 0, max_new = 0, produced0 = 0, max_context = 0;
++    int x0 = 0, S_mtp = 1, first_window = 1;
++    float min_p = 0.5f;
++    int eos[kMaxEos] = {};
++    int n_eos = 0;
++    int ple_prev[2] = {0, 0};
++    int drafts[kMaxT] = {};
++    float dprob[kMaxT] = {};
++    int pen_tail[kPenCap] = {};   // the last pen_n tokens the state consumed since the penalties' window began
++    int pen_n = 0;
++};
++
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
++inline bool devlaunch_on() { return false; }
++inline bool loop_on() { return false; }
++inline void capture_done(cudaStream_t) {}
++inline void prepare_device(int) {}
++inline const void* register_table(const void*, size_t) { return nullptr; }
++inline cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags) {
++    return cudaGraphInstantiate(ex, g, flags);
++}
++inline cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s) { return cudaGraphLaunch(ex, s); }
++#else
++/// STRATA_BLINK_DEVLAUNCH=1 or STRATA_BLINK=1
++bool devlaunch_on();
++/// STRATA_BLINK=1: the GPU-resident decode loop
++bool loop_on();
++/// (inside a capture) the end-of-graph counter bump the loop waits on; a no-op unless loop_on()
++void capture_done(cudaStream_t s);
++/// once per device, outside any capture (Verifier::init, MtpDrafter::load): the counter, and the loop's kernels loaded
++void prepare_device(int device);
++/// this device's counter (prepare_device made it; nullptr if it did not)
++unsigned* done_counter(int device);
++/// M3: register host memory (the PLE table, read only) for every GPU once; its device address, or nullptr
++const void* register_table(const void* p, size_t bytes);
++/// cudaGraphInstantiate, plus cudaGraphInstantiateFlagDeviceLaunch when devlaunch_on()
++cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags);
++/// a graph instantiated for device launch: launched from the device through its launcher; any other: cudaGraphLaunch
++cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s);
++
++/// One request's decode loop on the GPUs.
++class Loop {
++public:
++    ~Loop();
++    bool start(const LoopArgs& a, std::string& err);   // launches both schedulers; returns at once
++    Ctl* ctl() const { return ctl_; }                  // the host's view (volatile accesses)
++    bool wait(std::string& err);                        // after ctl()->finished: both schedulers have exited
++private:
++    Ctl* ctl_ = nullptr;
++    Ctl* ctl_dev_ = nullptr;
++    void* st0_ = nullptr;
++    void* st1_ = nullptr;
++    StageDesc* d_s0_ = nullptr;
++    StageDesc* d_s1_ = nullptr;
++    MtpDesc* d_mtp_ = nullptr;
++    cudaStream_t q0_ = nullptr, q1_ = nullptr;
++    cudaGraphExec_t g0_ = nullptr, g1_ = nullptr;
++    int* ple_in_ = nullptr;               // M3: device, [T, prev0, prev1, tokens...]
++    cudaGraphExec_t ple_g_ = nullptr;     // M3: the gather graph (GPU0)
++    int dev0_ = 0, dev1_ = 1;
++};
++#endif
++
++}  // namespace strata::blink
+diff --git a/include/strata/core/host_graph_launch.hpp b/include/strata/core/host_graph_launch.hpp
+index 2993997..405227b 100644
+--- a/include/strata/core/host_graph_launch.hpp
++++ b/include/strata/core/host_graph_launch.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "strata/core/blink.hpp"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <functional>
+@@ -21,12 +22,12 @@ public:
+             pending_.store(true);
+             worker_ = std::thread([this, graph, device] {
+                 auto error = cudaSetDevice(device);
+-                if (error == cudaSuccess) error = cudaGraphLaunch(graph, stream_);
++                if (error == cudaSuccess) error = strata::blink::launch(graph, stream_);
+                 error_ = error;
+                 pending_.store(false, std::memory_order_release);
+             });
+         } else {
+-            error_ = cudaGraphLaunch(graph, stream_);
++            error_ = strata::blink::launch(graph, stream_);
+         }
+     }
+     HostGraphLaunch(const HostGraphLaunch&) = delete;
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 709aba7..d775215 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -19,6 +19,7 @@
+ //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
+ #pragma once
+ 
++#include "strata/core/blink.hpp"
+ #include "strata/core/layer.hpp"
+ #include "strata/core/pinned_ring.hpp"
+ #include "strata/core/session.hpp"
+@@ -228,6 +229,11 @@ public:
+         return true;
+     }
+ 
++    /// Blink M2 (strata/core/blink.hpp): capture every round and step graph and describe them for the GPU-resident loop.
++    /// Fails (with the reason in `err`) for a configuration the device loop does not reproduce exactly.
++    bool blink_desc(strata::blink::MtpDesc& d, std::string& err);
++    void blink_after(int64_t n_rounds) { rounds += n_rounds; }
++
+ private:
+     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+     /// False (with `err`) while the experts are lent to a prompt: the prompt path's ring is pointed at their bytes
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index fb8cf10..71a4726 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -21,6 +21,7 @@
+ // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
+ #pragma once
+ 
++#include "strata/core/blink.hpp"
+ #include <cstdio>
+ 
+ #include "strata/core/expert_source.hpp"
+@@ -317,6 +318,13 @@ public:
+     }
+     const int32_t* batch_out() const { return b_out_; }
+     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
++    /// Blink M2 (strata/core/blink.hpp): capture windows 1..max_T and the commit, and describe them for the GPU-resident
++    /// loop.  Fails (with the reason in `err`) unless this stage runs its zero-doorbell all-resident graph.
++    bool blink_desc(strata::blink::StageDesc& d, int max_T, std::string& err);
++    /// Blink M2: the first stage's PLE rows of a window (rows from `tokens` and the history `prev`), then its PLE flag
++    bool blink_ple_serve(const int32_t* tokens, int T, const int32_t* prev, std::string& err);
++    /// Blink M2: after the loop, the host-side bookkeeping a window and its commit would have left
++    void blink_after(int last_T, int64_t last_pos0, const int32_t* last_tokens, int64_t n_windows, const int32_t* ple_prev);
+     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
+     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
+     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
+@@ -568,6 +576,8 @@ private:
+     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+     int hist_len_ = 0;
+     bool head_sampling_ = true;          ///< set_head_sampling
++    cudaGraphExec_t blink_samp_[strata::blink::kMaxT + 1] = {};   ///< Blink M2: the penalised pick per window size
++    struct { const int32_t* h = nullptr; int n = 0, last_n = 0; float rep = 1, freq = 0, pres = 0; } blink_samp_key_;
+ #if defined(STRATA_GPU_METAL)
+     void* metal_ = nullptr;              ///< the Metal decode window (metal/src/engine/window.cpp): init/run/commit go there
+ #endif
+diff --git a/include/strata/kernels/ngram.hpp b/include/strata/kernels/ngram.hpp
+index bfc0977..0a350b5 100644
+--- a/include/strata/kernels/ngram.hpp
++++ b/include/strata/kernels/ngram.hpp
+@@ -220,6 +220,10 @@ public:
+     /// conversation cache no room (#4518).
+     bool unlock();
+     uint64_t rows() const;
++    /// Blink M3: the table's rows in memory (--ple-io ram / mmap, PLE_ROW_BYTES each in the table's format), or nullptr
++    const uint8_t* mapped_rows() const;
++    /// Blink M3: true for an IQ4_NL table of PLE_ROW_BYTES rows (the format the device gather decodes)
++    bool is_iq4nl() const;
+     /// Bytes of the whole table (rows x row bytes) while open; 0 when closed.  The residency policy in
+     /// generate.cpp sizes the table with this before it decides to keep it in RAM.
+     uint64_t table_bytes() const;
+diff --git a/src/core/blink.cu b/src/core/blink.cu
+new file mode 100644
+index 0000000..c47ab24
+--- /dev/null
++++ b/src/core/blink.cu
+@@ -0,0 +1,803 @@
++// src/core/blink.cu - see include/strata/core/blink.hpp.  Built as its own static library with relocatable device code
++// (the device runtime's cudaGraphLaunch), so no other Strata target changes how it is compiled.
++#include "strata/core/blink.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <cuda_fp16.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstddef>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++#include <algorithm>
++#include <thread>
++#include <vector>
++
++namespace strata::blink {
++namespace {
++
++// ---------------------------------------------------------------------------------------------------------------
++// M1: device-side launch of the engine's graphs, the host still driving
++// ---------------------------------------------------------------------------------------------------------------
++
++__global__ void ff_launch(cudaGraphExec_t g, int* err) {
++    if (threadIdx.x != 0 || blockIdx.x != 0) return;
++    const cudaError_t e = cudaGraphLaunch(g, cudaStreamGraphFireAndForget);
++    if (e != cudaSuccess) atomicCAS(err, 0, (int) e);
++}
++
++__global__ void done_bump(unsigned* c) {
++    __threadfence_system();   // everything the graph wrote before this node (mapped outputs included) is visible first
++    atomicAdd(c, 1u);
++}
++
++struct Registry {
++    std::mutex mu;
++    std::unordered_set<cudaGraphExec_t> uploaded;
++    std::unordered_map<cudaGraphExec_t, cudaGraphExec_t> launcher;   // child -> its launcher graph
++    int* h_err = nullptr;                                            // mapped, portable
++    int* d_err = nullptr;
++    std::atomic<long long> launches{0};
++    unsigned* done[16] = {};
++};
++Registry& reg() {
++    static Registry r;
++    return r;
++}
++
++bool ensure_err(Registry& r) {
++    if (r.h_err != nullptr) return true;
++    if (cudaHostAlloc((void**) &r.h_err, sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
++    *(volatile int*) r.h_err = 0;
++    return cudaHostGetDevicePointer((void**) &r.d_err, r.h_err, 0) == cudaSuccess;
++}
++
++cudaError_t make_launcher(Registry& r, cudaGraphExec_t child, cudaGraphExec_t* out) {
++    cudaGraph_t g = nullptr;
++    cudaError_t e = cudaGraphCreate(&g, 0);
++    if (e != cudaSuccess) return e;
++    cudaKernelNodeParams kp{};
++    void* args[] = {&child, &r.d_err};
++    kp.func = (void*) ff_launch;
++    kp.gridDim = dim3(1);
++    kp.blockDim = dim3(32);
++    kp.kernelParams = args;
++    cudaGraphNode_t n = nullptr;
++    e = cudaGraphAddKernelNode(&n, g, nullptr, 0, &kp);
++    if (e == cudaSuccess) e = cudaGraphInstantiate(out, g, 0);
++    cudaGraphDestroy(g);
++    return e;
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// M2: the decode loop on the GPUs
++// ---------------------------------------------------------------------------------------------------------------
++
++template <class T> __device__ __forceinline__ T vld(const T* p) { return *(const volatile T*) p; }
++template <class T> __device__ __forceinline__ void vst(T* p, T v) { *(volatile T*) p = v; }
++__device__ __forceinline__ void nap() { __nanosleep(128); }
++
++struct St1 {   // GPU1's loop state, kept in device memory across tail relaunches
++    int w, x, first, pad;
++    long long p, produced, windows, offered, accepted, launches, relaunches;
++    int drafts[kMaxT];
++    float dprob[kMaxT];
++    int pen_n, pen_pad;
++    int pen_tail[kPenCap];
++};
++struct St0 {
++    int w, pad;
++    int ple_prev[2];
++    long long launches, relaunches;
++    int* ple_in;                 // M3: [T, prev0, prev1, tokens...] for the gather graph
++    cudaGraphExec_t ple_g;       // M3: the gather graph
++};
++
++// fire-and-forget, retried while the previous launch of the same graph is still retiring (it reports "invalid argument")
++__device__ int ff(cudaGraphExec_t g, long long* launches) {
++    cudaError_t e = cudaGraphLaunch(g, cudaStreamGraphFireAndForget);
++    for (int tries = 0; e == cudaErrorInvalidValue && tries < 20000; ++tries) {
++        __nanosleep(1000);
++        e = cudaGraphLaunch(g, cudaStreamGraphFireAndForget);
++    }
++    if (e == cudaSuccess) ++*launches;
++    return (int) e;
++}
++__device__ __forceinline__ void wait_done(const unsigned* c, unsigned target) {
++    while ((int) (vld(c) - target) < 0) {}
++    __threadfence_system();
++}
++
++// Verifier::stage_inputs, on the device
++__device__ void stage_window(const StageDesc& d, int T, const int* tokens, long long pos0) {
++    int32_t* const pq = d.pos;
++    int32_t* const pk = pq + (size_t) d.max_t * d.n_head;
++    int32_t* const pi = pk + (size_t) d.max_t * d.n_head_kv;
++    const long long w = (long long) d.idx_top_k + d.idx_block - 1;
++    for (int t = 0; t < T; ++t) {
++        const long long pos = pos0 + t, n_kv = pos + 1;
++        vst(&d.tok[t], (int32_t) tokens[t]);
++        vst(&d.step[t * 4 + 0], (int32_t) pos);
++        vst(&d.step[t * 4 + 1], (int32_t) n_kv);
++        vst(&d.step[t * 4 + 2], (int32_t) (n_kv / d.idx_block));
++        vst(&d.step[t * 4 + 3], (int32_t) (n_kv < w ? n_kv : w));
++        const int32_t pt = (int32_t) pos;
++        for (int h = 0; h < d.n_head; ++h) vst(&pq[t * d.n_head + h], pt);
++        for (int h = 0; h < d.n_head_kv; ++h) vst(&pk[t * d.n_head_kv + h], pt);
++        for (int h = 0; h < d.idx_q_heads; ++h) vst(&pi[t * d.idx_q_heads + h], pt);
++    }
++    vst(d.seq, 0u);
++    vst(d.flag, 0u);
++    vst(d.flagA, 0u);
++    vst(d.flagB, 0u);
++    if (d.hflag_out) vst(d.hflag_out, 0u);
++    if (d.herr) vst(d.herr, 0u);
++    if (d.hdrop) vst(d.hdrop, 0u);
++    __threadfence_system();
++}
++
++// Verifier::commit's staging and graph, on the device
++__device__ int commit_stage(const StageDesc& d, int nk, int T, long long pos0, long long* launches) {
++    vst(&d.commit[0], (int32_t) nk);
++    vst(&d.commit[1], (int32_t) (nk - 1));
++    for (int t = 0; t < d.max_t; ++t) vst(&d.commit[2 + t], t < nk ? (int32_t) (pos0 + t) : (int32_t) -1);
++    __threadfence_system();
++    if (T == 1 && d.self_commit_t1) return 0;   // a one-row window advanced the state itself
++    const unsigned base = vld(d.done);
++    const int e = ff(d.commit_exec, launches);
++    if (e != 0) return e;
++    wait_done(d.done, base + 1);
++    return 0;
++}
++
++__device__ __forceinline__ bool is_eos(const Ctl* C, int y) {
++    for (int i = 0; i < C->n_eos; ++i)
++        if (C->eos[i] == y) return true;
++    return false;
++}
++
++// MtpDrafter::draft (the --spec-min-p chain), on the device
++__device__ int draft(const MtpDesc& M, int T, const int* tokens, long long p, int a, St1* st, float min_p) {
++    const int Tm = M.catchup_all ? (T < M.max_t ? T : M.max_t) : a + 1;
++    long long ms = (long long) (M.max_t - 1 < M.max_drafts ? M.max_t - 1 : M.max_drafts);
++    if (M.max_cells - (p + a) < ms) ms = M.max_cells - (p + a);
++    const int max_steps = (int) ms;
++    const int NH = M.n_head;
++    auto put = [&](int row, long long cell) {
++        vst(&M.step[row * 4 + 0], (int32_t) cell);
++        vst(&M.step[row * 4 + 1], (int32_t) (cell + 1));
++        vst(&M.step[row * 4 + 2], (int32_t) ((cell + 1) / 4));
++        vst(&M.step[row * 4 + 3], (int32_t) (cell + 1));
++        for (int h = 0; h < NH; ++h) vst(&M.pos[row * NH + h], (int32_t) cell);
++    };
++    for (int t = 0; t < Tm; ++t) {
++        vst(&M.tok[t], (int32_t) tokens[t]);
++        put(t, p + t);
++    }
++    put(2 * M.max_t - 1, p + a);
++    for (int j = 1; j < max_steps; ++j) put(M.max_t + j - 1, p + a + j);
++    for (int j = 0; j < max_steps; ++j) vst(&M.out[j], (int32_t) -1);
++    vst(&M.row[0], (int32_t) a);
++    vst(&M.row[1], (int32_t) 0);
++    if (M.force)
++        for (int j = 0; j < 16; ++j) vst(&M.force[j], (int32_t) -1);
++    __threadfence_system();
++    int n = 0;
++    if (max_steps > 0) {
++        unsigned base = vld(M.done);
++        int e = ff(M.round[Tm], &st->launches);
++        if (e != 0) return e;
++        wait_done(M.done, base + 1);
++        st->drafts[0] = vld(&M.out[0]);
++        float pj = vld(&M.prob[0]);
++        st->dprob[0] = pj;
++        n = 1;
++        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
++            base = vld(M.done);
++            e = ff(M.step_g[j], &st->launches);
++            if (e != 0) return e;
++            wait_done(M.done, base + 1);
++            st->drafts[j] = vld(&M.out[j]);
++            pj = vld(&M.prob[j]);
++            st->dprob[j] = pj;
++            ++n;
++        }
++    }
++    for (int j = n; j < M.max_t - 1 && j < kMaxT; ++j) {
++        st->drafts[j] = 0;
++        st->dprob[j] = 0.0f;
++    }
++    return 0;
++}
++
++// M3: the first stage's PLE rows on the device - ngram_rows (the hash) and iq4nl_dequant_row, bit for bit.  One block a
++// (token, head) row, 160 threads one value each; `in` = [T, prev0 (oldest), prev1 (newest), tokens 0..T-1].
++__constant__ int8_t kIq4NlDev[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
++__global__ void ple_gather_kernel(const StageDesc* __restrict__ S, const int* __restrict__ in) {
++    const int T = in[0];
++    const int t = (int) blockIdx.x / 16, h = (int) blockIdx.x % 16;
++    if (t >= T) return;
++    __shared__ unsigned long long row_s;
++    if (threadIdx.x == 0) {
++        auto pred = [&](int sb) -> int {   // the token `sb` positions before token t (sb = 1: the newest)
++            const int k = t - sb;
++            return k >= 0 ? in[3 + k] : (k == -1 ? in[2] : in[1]);
++        };
++        long long ctx[3];
++        ctx[0] = in[3 + t];
++        bool cut = false;
++        for (int sb = 1; sb < 3; ++sb) {   // the cut before the store: a position whose predecessor was EOS is EOS
++            const int tk = cut ? -1 : pred(sb);
++            cut = cut || tk < 0 || tk == 248044;
++            ctx[sb] = cut ? 248044 : tk;
++        }
++        const int n = h < 8 ? 2 : 3;   // heads 0..7: bigrams, 8..15: trigrams
++        unsigned long long mixed = (unsigned long long) ctx[0] * S->ple_mult[0];
++        for (int j = 1; j < n; ++j) mixed ^= (unsigned long long) ctx[j] * S->ple_mult[j];
++        row_s = (unsigned long long) (uint32_t) (mixed % S->ple_vocab[h] + S->ple_offset[h]);
++    }
++    __syncthreads();
++    const unsigned long long row = row_s;
++    float* o = S->ple_out + ((size_t) t * 16 + h) * 160;
++    const int k = (int) threadIdx.x;
++    if (k >= 160) return;
++    if (row >= S->ple_rows) { o[k] = 0.0f; return; }   // read_row: a row past the table is +0.0f
++    const uint8_t* blk = S->ple_table + row * 90 + (size_t) (k / 32) * 18;
++    const int j = k % 32;
++    const unsigned short dbits = (unsigned short) (blk[0] | (blk[1] << 8));
++    const float d = __half2float(__ushort_as_half(dbits));
++    const int q = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
++    o[k] = __fmul_rn(d, (float) kIq4NlDev[q]);
++}
++__global__ void ple_flag_kernel(const StageDesc* __restrict__ S) {
++    __threadfence_system();   // every row above is in the mapped buffer first
++    *(volatile uint32_t*) S->flag = 1u;
++    __threadfence_system();
++}
++
++__device__ void finish1(Ctl* C, St1* st, int reason, int err = 0, int where = 0) {
++    vst(&C->p_end, st->p);
++    vst(&C->x_end, st->x);
++    vst(&C->windows, st->windows);
++    vst(&C->offered, st->offered);
++    vst(&C->accepted, st->accepted);
++    vst(&C->launches1, st->launches);
++    vst(&C->relaunches1, st->relaunches);
++    if (err) {
++        vst(&C->err, err);
++        vst(&C->err_where, where);
++    }
++    __threadfence_system();
++    vst(&C->exit_req, 1);
++    __threadfence_system();
++    vst(&C->finished, reason);
++    __threadfence_system();
++}
++
++// GPU1: the last stage, the head and the drafter
++__global__ void sched1(const StageDesc* __restrict__ S, const MtpDesc* __restrict__ M, Ctl* C, St1* st) {
++    if (threadIdx.x != 0 || blockIdx.x != 0) return;
++    const int per_window = 3 + (M->max_t > 1 ? M->max_t - 1 : 1);
++    long long launched = 0;   // in this graph execution
++    for (;;) {
++        const long long cap = C->max_new;
++        long long produced = st->produced;
++        if (produced >= cap) { finish1(C, st, kLength); return; }
++        if (launched + per_window > kFFLimit) {   // window recovery: a fresh execution of this graph, same state
++            ++st->relaunches;
++            __threadfence();
++            cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
++            return;
++        }
++        int T = 1;
++        if (!st->first)
++            while (T < C->S_mtp && st->dprob[T - 1] >= C->min_p) ++T;
++        const long long p = st->p;
++        if (p + T > C->max_context) { finish1(C, st, kContext); return; }
++        int win[kMaxT];
++        win[0] = st->x;
++        for (int i = 1; i < T; ++i) win[i] = st->drafts[i - 1];
++        const int w = st->w + 1;
++        // the window to GPU0
++        vst(&C->T, T);
++        vst(&C->p, p);
++        for (int i = 0; i < T; ++i) vst(&C->tokens[i], win[i]);
++        __threadfence_system();
++        vst(&C->win_seq, w);
++        __threadfence_system();
++        stage_window(*S, T, win, p);
++        while (vld(&C->s0_done) < w) {
++            if (vld(&C->err) != 0) { finish1(C, st, kError); return; }
++            nap();
++        }
++        __threadfence_system();
++        // this GPU's half
++        const long long l0 = st->launches;
++        unsigned base = vld(S->done);
++        int e = ff(S->win[T], &st->launches);
++        if (e != 0) { finish1(C, st, kError, e, 1); return; }
++        wait_done(S->done, base + 1);
++        if (S->samp[T] != nullptr) {   // repetition penalties: the penalised pick again, over each row's history (penalty_rows)
++            const int h = S->hist_len;
++            for (int t = 0; t < T; ++t) {
++                int32_t* row = S->hist + (size_t) t * h;
++                const int avail = st->pen_n + t + 1;
++                const int take = avail < h ? avail : h;
++                for (int j = 0; j < h - take; ++j) row[j] = -1;
++                for (int j = 0; j < take; ++j) {
++                    const int i = avail - take + j;
++                    row[h - take + j] = i < st->pen_n ? st->pen_tail[i] : win[i - st->pen_n];
++                }
++            }
++            __threadfence();
++            base = vld(S->done);
++            e = ff(S->samp[T], &st->launches);
++            if (e != 0) { finish1(C, st, kError, e, 4); return; }
++            wait_done(S->done, base + 1);
++        }
++        int outv[kMaxT];
++        for (int t = 0; t < T; ++t) outv[t] = vld(&S->out[t]);
++        int nf_row = -1;
++        if (S->nf != nullptr)
++            for (int t = 0; t < T && nf_row < 0; ++t)
++                for (int b = 0; b < S->nf_blocks; ++b)
++                    if (vld(&S->nf[t * S->nf_blocks + b]) != 0) { nf_row = t; break; }
++        // accept: the longest run of drafts the model agrees with, cut at an EOS and at the token cap
++        int a = 0;
++        while (a < T - 1 && win[a + 1] == outv[a]) ++a;
++        {
++            const long long rem = cap - produced;
++            const int cnt = (int) ((long long) (a + 1) < (rem > 0 ? rem : 0) ? (long long) (a + 1) : (rem > 0 ? rem : 0));
++            int bound = cnt;
++            for (int i = 0; i < cnt; ++i)
++                if (is_eos(C, outv[i])) { bound = i + 1; break; }
++            a = bound - 1;
++        }
++        // commit, both stages
++        vst(&C->n_keep, a + 1);
++        __threadfence_system();
++        vst(&C->commit_seq, w);
++        __threadfence_system();
++        e = commit_stage(*S, a + 1, T, p, &st->launches);
++        if (e != 0) { finish1(C, st, kError, e, 2); return; }
++        while (vld(&C->s0_commit_done) < w) {
++            if (vld(&C->err) != 0) { finish1(C, st, kError); return; }
++            nap();
++        }
++        __threadfence_system();
++        st->w = w;
++        ++st->windows;
++        vst(&C->last_T, T);
++        vst(&C->last_a, a);
++        vst(&C->last_p, p);
++        for (int i = 0; i < T; ++i) vst(&C->last_window[i], win[i]);
++        if (nf_row >= 0) { finish1(C, st, kNonfinite); return; }   // none of its tokens goes out
++        if (S->samp[T] != nullptr)   // the state consumed window[0..a]: the penalties' tail grows by them
++            for (int i = 0; i <= a; ++i) {
++                const int h = S->hist_len;
++                if (st->pen_n < h) {
++                    st->pen_tail[st->pen_n++] = win[i];
++                } else {
++                    for (int j = 1; j < h; ++j) st->pen_tail[j - 1] = st->pen_tail[j];
++                    st->pen_tail[h - 1] = win[i];
++                }
++            }
++        st->offered += T - 1;
++        st->accepted += a;
++        st->first = 0;
++        // emit
++        bool eos = false;
++        for (int i = 0; i <= a && produced < cap && !eos; ++i) {
++            while (produced - vld(&C->consumed) >= (long long) kRing) nap();
++            vst(&C->ring[produced % kRing], outv[i]);
++            ++produced;
++            eos = is_eos(C, outv[i]);
++        }
++        __threadfence_system();
++        vst(&C->produced, produced);
++        __threadfence_system();
++        st->produced = produced;
++        // draft the next window
++        if (!eos && produced < cap) {
++            e = draft(*M, T, outv, p, a, st, C->min_p);
++            if (e != 0) { finish1(C, st, kError, e, 3); return; }
++        }
++        launched += st->launches - l0;
++        if (eos) { finish1(C, st, kStop); return; }
++        if (vld(&C->stop) != 0) { finish1(C, st, kCancel); return; }
++        st->x = outv[a];
++        st->p = p + a + 1;
++    }
++}
++
++// GPU0: the first stage
++__global__ void sched0(const StageDesc* __restrict__ S, Ctl* C, St0* st) {
++    if (threadIdx.x != 0 || blockIdx.x != 0) return;
++    long long launched = 0;
++    for (;;) {
++        const int w = st->w + 1;
++        for (;;) {
++            if (vld(&C->win_seq) >= w) break;
++            if (vld(&C->exit_req) != 0) {
++                vst(&C->ple_prev_end[0], st->ple_prev[0]);
++                vst(&C->ple_prev_end[1], st->ple_prev[1]);
++                vst(&C->launches0, st->launches);
++                vst(&C->relaunches0, st->relaunches);
++                __threadfence_system();
++                return;
++            }
++            nap();
++        }
++        if (launched + 3 > kFFLimit) {
++            ++st->relaunches;
++            __threadfence();
++            cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
++            return;
++        }
++        __threadfence_system();
++        const int T = vld(&C->T);
++        const long long p = vld(&C->p);
++        int tok[kMaxT];
++        for (int i = 0; i < T; ++i) tok[i] = vld(&C->tokens[i]);
++        stage_window(*S, T, tok, p);
++        const long long l0 = st->launches;
++        int e = 0;
++        if (S->ple_mode == 2) {   // M3: the rows gathered on this GPU, beside the window (its layer 1 waits for the flag)
++            st->ple_in[0] = T;
++            st->ple_in[1] = st->ple_prev[0];
++            st->ple_in[2] = st->ple_prev[1];
++            for (int i = 0; i < T; ++i) st->ple_in[3 + i] = tok[i];
++            __threadfence();
++            e = ff(st->ple_g, &st->launches);
++            if (e != 0) { vst(&C->err_where, 13); __threadfence_system(); vst(&C->err, e); return; }
++        }
++        const unsigned base = vld(S->done);
++        e = ff(S->win[T], &st->launches);
++        if (e != 0) { vst(&C->err_where, 10); __threadfence_system(); vst(&C->err, e); return; }
++        if (S->ple_mode == 1) {   // M2: the host gathers them and raises the flag layer 1 waits on
++            vst(&C->ple_T, T);
++            for (int i = 0; i < T; ++i) vst(&C->ple_tokens[i], tok[i]);
++            vst(&C->ple_prev[0], st->ple_prev[0]);
++            vst(&C->ple_prev[1], st->ple_prev[1]);
++            __threadfence_system();
++            vst(&C->ple_seq, w);
++            __threadfence_system();
++        } else if (S->ple_mode == 0) {
++            vst(S->flag, 1u);
++            __threadfence_system();
++        }
++        wait_done(S->done, base + 1);
++        if (S->plan_err != nullptr && vld(S->plan_err) != 0) {
++            vst(&C->err_where, 11); __threadfence_system(); vst(&C->err, -1); return;
++        }
++        vst(&C->s0_done, w);
++        __threadfence_system();
++        while (vld(&C->commit_seq) < w) {
++            if (vld(&C->exit_req) != 0) return;   // (GPU1 always commits a window it ran; an error ends it)
++            nap();
++        }
++        __threadfence_system();
++        const int nk = vld(&C->n_keep);
++        e = commit_stage(*S, nk, T, p, &st->launches);
++        if (e != 0) { vst(&C->err_where, 12); __threadfence_system(); vst(&C->err, e); return; }
++        for (int t = 0; t < nk; ++t) {   // the session's PLE history advances by the kept rows
++            st->ple_prev[0] = st->ple_prev[1];
++            st->ple_prev[1] = tok[t];
++        }
++        st->w = w;
++        launched += st->launches - l0;
++        __threadfence_system();
++        vst(&C->s0_commit_done, w);
++        __threadfence_system();
++    }
++}
++
++cudaError_t make_sched_graph(cudaStream_t q, bool first_stage, const StageDesc* s, const MtpDesc* m, Ctl* c, void* st,
++                             cudaGraphExec_t* out) {
++    cudaGraph_t g = nullptr;
++    cudaError_t e = cudaStreamBeginCapture(q, cudaStreamCaptureModeThreadLocal);
++    if (e != cudaSuccess) return e;
++    if (first_stage) sched0<<<1, 32, 0, q>>>(s, c, (St0*) st);
++    else sched1<<<1, 32, 0, q>>>(s, m, c, (St1*) st);
++    e = cudaStreamEndCapture(q, &g);
++    if (e != cudaSuccess) return e;
++    e = cudaGraphInstantiateWithFlags(out, g, cudaGraphInstantiateFlagDeviceLaunch);
++    cudaGraphDestroy(g);
++    if (e == cudaSuccess) e = cudaGraphUpload(*out, q);
++    return e;
++}
++
++struct DevGuard {
++    int prev = 0;
++    DevGuard() { cudaGetDevice(&prev); }
++    ~DevGuard() { cudaSetDevice(prev); }
++};
++
++}  // namespace
++
++// ---------------------------------------------------------------------------------------------------------------
++
++bool loop_on() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_BLINK");
++        const bool o = v != nullptr && std::atoi(v) != 0;
++        if (o) std::fprintf(stderr, "strata blink: M2 on - the decode loop runs on the GPUs where it can (STRATA_BLINK=1)\n");
++        return o;
++    }();
++    return on;
++}
++
++bool devlaunch_on() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_BLINK_DEVLAUNCH");
++        const bool o = (v != nullptr && std::atoi(v) != 0) || loop_on();
++        if (o && !loop_on())
++            std::fprintf(stderr, "strata blink: M1 on - verify / commit / MTP graphs are launched from the GPU (fire-and-forget)\n");
++        return o;
++    }();
++    return on;
++}
++
++void prepare_device(int device) {
++    if (!loop_on() || device < 0 || device >= 16) return;
++    Registry& r = reg();
++    std::lock_guard<std::mutex> lk(r.mu);
++    if (r.done[device] != nullptr) return;
++    int prev = 0;
++    cudaGetDevice(&prev);
++    if (prev != device) cudaSetDevice(device);
++    // load this module's kernels on the device now: a lazily loaded kernel first launched inside a capture is not safe
++    cudaFuncAttributes fa{};
++    (void) cudaFuncGetAttributes(&fa, (const void*) done_bump);
++    (void) cudaFuncGetAttributes(&fa, (const void*) ff_launch);
++    (void) cudaFuncGetAttributes(&fa, (const void*) sched0);
++    (void) cudaFuncGetAttributes(&fa, (const void*) sched1);
++    unsigned* c = nullptr;
++    if (cudaMalloc((void**) &c, 64) == cudaSuccess && cudaMemset(c, 0, 64) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
++        r.done[device] = c;
++        std::fprintf(stderr, "strata blink: device %d prepared (completion counter, loop kernels loaded)\n", device);
++    } else {
++        std::fprintf(stderr, "strata blink: device %d could not be prepared: %s\n", device, cudaGetErrorString(cudaGetLastError()));
++    }
++    if (prev != device) cudaSetDevice(prev);
++}
++
++unsigned* done_counter(int device) {
++    if (device < 0 || device >= 16) return nullptr;
++    Registry& r = reg();
++    std::lock_guard<std::mutex> lk(r.mu);
++    return r.done[device];
++}
++
++const void* register_table(const void* p, size_t bytes) {
++    static std::mutex mu;
++    static const void* done_p = nullptr;
++    static const void* done_d = nullptr;
++    std::lock_guard<std::mutex> lk(mu);
++    if (p == nullptr || bytes == 0) return nullptr;
++    if (done_p == p) return done_d;
++    const size_t pg = 4096;
++    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) (pg - 1);
++    const size_t len = (((uintptr_t) p + bytes - a) + pg - 1) & ~(pg - 1);
++    const auto t0 = std::chrono::steady_clock::now();
++    auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
++    // 1) the mapping itself, read only, then writable (a file mapping is often refused: "operation not supported")
++    for (unsigned extra : {(unsigned) cudaHostRegisterReadOnly, 0u}) {
++        if (cudaHostRegister((void*) a, len, cudaHostRegisterMapped | cudaHostRegisterPortable | extra) == cudaSuccess) {
++            void* d = nullptr;
++            if (cudaHostGetDevicePointer(&d, (void*) a, 0) == cudaSuccess) {
++                done_p = p;
++                done_d = (const uint8_t*) d + ((uintptr_t) p - a);
++                std::fprintf(stderr, "strata blink: the PLE table (%.1f GiB) is registered in place for the GPUs (%.1f s)\n",
++                             (double) len / 1073741824.0, secs());
++                return done_d;
++            }
++            cudaHostUnregister((void*) a);
++        }
++        (void) cudaGetLastError();
++    }
++    // 2) a pinned, mapped copy (as the expert arena is pinned): the table read once into it, in parallel
++    void* h = nullptr;
++    if (cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
++        std::fprintf(stderr, "strata blink: no pinned copy of the PLE table (%.1f GiB): %s\n", (double) bytes / 1073741824.0,
++                     cudaGetErrorString(cudaGetLastError()));
++        return nullptr;
++    }
++    {
++        const int nt = 8;
++        std::vector<std::thread> th;
++        const size_t chunk = (bytes + nt - 1) / nt;
++        for (int i = 0; i < nt; ++i)
++            th.emplace_back([&, i] {
++                const size_t b = (size_t) i * chunk, e2 = std::min(bytes, b + chunk);
++                if (b < e2) std::memcpy((uint8_t*) h + b, (const uint8_t*) p + b, e2 - b);
++            });
++        for (auto& x : th) x.join();
++    }
++    void* d = nullptr;
++    if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) { (void) cudaGetLastError(); cudaFreeHost(h); return nullptr; }
++    done_p = p;
++    done_d = d;
++    std::fprintf(stderr, "strata blink: the PLE table (%.1f GiB) is copied to pinned memory the GPUs read (%.1f s)\n",
++                 (double) bytes / 1073741824.0, secs());
++    return done_d;
++}
++
++void capture_done(cudaStream_t s) {
++    if (!loop_on()) return;
++    int dev = 0;
++    if (cudaStreamGetDevice(s, &dev) != cudaSuccess) {
++        (void) cudaGetLastError();
++        cudaGetDevice(&dev);
++    }
++    unsigned* c = done_counter(dev);
++    if (c != nullptr) done_bump<<<1, 1, 0, s>>>(c);
++    else std::fprintf(stderr, "strata blink: device %d was not prepared: a graph without its completion bump\n", dev);
++}
++
++cudaError_t instantiate(cudaGraphExec_t* ex, cudaGraph_t g, unsigned long long flags) {
++    if (!devlaunch_on()) return cudaGraphInstantiate(ex, g, flags);
++    const cudaError_t e = cudaGraphInstantiate(ex, g, flags | cudaGraphInstantiateFlagDeviceLaunch);
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "strata blink: instantiate for device launch failed: %s\n", cudaGetErrorString(e));
++        return e;
++    }
++    Registry& r = reg();
++    std::lock_guard<std::mutex> lk(r.mu);
++    r.uploaded.erase(*ex);   // a reused handle value is a new graph
++    r.launcher.erase(*ex);
++    return e;
++}
++
++cudaError_t launch(cudaGraphExec_t ex, cudaStream_t s) {
++    if (!devlaunch_on()) return cudaGraphLaunch(ex, s);
++    // the graph's own flags, not a registry: Strata destroys and recaptures graphs, and a handle value can come back
++    unsigned long long fl = 0;
++    if (cudaGraphExecGetFlags(ex, &fl) != cudaSuccess || (fl & cudaGraphInstantiateFlagDeviceLaunch) == 0)
++        return cudaGraphLaunch(ex, s);   // not instantiated for device launch: as before
++    Registry& r = reg();
++    cudaGraphExec_t le = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(r.mu);
++        if (!ensure_err(r)) return cudaErrorMemoryAllocation;
++        if (const int de = *(volatile int*) r.h_err; de != 0) {
++            std::fprintf(stderr, "strata blink: an earlier device-side graph launch failed: %s\n",
++                         cudaGetErrorString((cudaError_t) de));
++            return (cudaError_t) de;
++        }
++        if (r.uploaded.insert(ex).second) {
++            const cudaError_t ue = cudaGraphUpload(ex, s);   // a device launch needs the graph on the device first
++            if (ue != cudaSuccess) {
++                r.uploaded.erase(ex);
++                return ue;
++            }
++        }
++        auto it = r.launcher.find(ex);
++        if (it == r.launcher.end()) {
++            const cudaError_t me = make_launcher(r, ex, &le);
++            if (me != cudaSuccess) return me;
++            r.launcher.emplace(ex, le);
++        } else {
++            le = it->second;
++        }
++    }
++    const long long n = ++r.launches;
++    if (n == 1 || n == 1000 || n == 100000)
++        std::fprintf(stderr, "strata blink: %lld host-requested device-side graph launches so far\n", n);
++    return cudaGraphLaunch(le, s);
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++
++Loop::~Loop() {
++    if (ctl_ != nullptr) cudaFreeHost(ctl_);
++}
++
++bool Loop::start(const LoopArgs& a, std::string& err) {
++    DevGuard guard;
++    dev0_ = a.dev0;
++    dev1_ = a.dev1;
++    auto ck = [&](cudaError_t e, const char* what) {
++        if (e == cudaSuccess) return true;
++        err = std::string("blink: ") + what + ": " + cudaGetErrorString(e);
++        return false;
++    };
++    if (ctl_ == nullptr) {
++        if (!ck(cudaHostAlloc((void**) &ctl_, sizeof(Ctl), cudaHostAllocMapped | cudaHostAllocPortable), "control block"))
++            return false;
++        if (!ck(cudaHostGetDevicePointer((void**) &ctl_dev_, ctl_, 0), "control block pointer")) return false;
++    }
++    std::memset((void*) ctl_, 0, offsetof(Ctl, ring));
++    ctl_->p0 = a.p0;
++    ctl_->max_new = a.max_new;
++    ctl_->produced0 = a.produced0;
++    ctl_->max_context = a.max_context;
++    ctl_->x0 = a.x0;
++    ctl_->S_mtp = a.S_mtp;
++    ctl_->first_window = a.first_window;
++    ctl_->min_p = a.min_p;
++    ctl_->n_eos = a.n_eos < kMaxEos ? a.n_eos : kMaxEos;
++    for (int i = 0; i < ctl_->n_eos; ++i) ctl_->eos[i] = a.eos[i];
++    ctl_->ple_prev0[0] = a.ple_prev[0];
++    ctl_->ple_prev0[1] = a.ple_prev[1];
++    ctl_->produced = a.produced0;
++    ctl_->consumed = a.produced0;
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++
++    St1 s1{};
++    s1.w = 0;
++    s1.x = a.x0;
++    s1.first = a.first_window;
++    s1.p = a.p0;
++    s1.produced = a.produced0;
++    for (int i = 0; i < kMaxT; ++i) {
++        s1.drafts[i] = a.drafts[i];
++        s1.dprob[i] = a.dprob[i];
++    }
++    s1.pen_n = a.pen_n < kPenCap ? a.pen_n : kPenCap;
++    for (int i = 0; i < s1.pen_n; ++i) s1.pen_tail[i] = a.pen_tail[i];
++    St0 s0{};
++    s0.ple_prev[0] = a.ple_prev[0];
++    s0.ple_prev[1] = a.ple_prev[1];
++
++    // GPU0: its stage
++    if (!ck(cudaSetDevice(dev0_), "device 0")) return false;
++    if (d_s0_ == nullptr) {
++        if (!ck(cudaMalloc((void**) &d_s0_, sizeof(StageDesc)), "desc 0") || !ck(cudaMalloc(&st0_, sizeof(St0)), "state 0") ||
++            !ck(cudaStreamCreateWithFlags(&q0_, cudaStreamNonBlocking), "stream 0"))
++            return false;
++    }
++    if (!ck(cudaMemcpy(d_s0_, &a.s0, sizeof(StageDesc), cudaMemcpyHostToDevice), "desc 0 copy") ||
++        !ck(cudaMemcpy(st0_, &s0, sizeof(St0), cudaMemcpyHostToDevice), "state 0 copy"))
++        return false;
++    if (a.s0.ple_mode == 2 && ple_g_ == nullptr) {
++        if (!ck(cudaMalloc((void**) &ple_in_, sizeof(int) * (3 + kMaxT)), "PLE input")) return false;
++        cudaGraph_t pg = nullptr;
++        if (!ck(cudaStreamBeginCapture(q0_, cudaStreamCaptureModeThreadLocal), "PLE capture")) return false;
++        ple_gather_kernel<<<16 * kMaxT, 160, 0, q0_>>>(d_s0_, ple_in_);
++        ple_flag_kernel<<<1, 1, 0, q0_>>>(d_s0_);
++        if (!ck(cudaStreamEndCapture(q0_, &pg), "PLE capture end")) return false;
++        const cudaError_t ie = cudaGraphInstantiateWithFlags(&ple_g_, pg, cudaGraphInstantiateFlagDeviceLaunch);
++        cudaGraphDestroy(pg);
++        if (!ck(ie, "PLE graph") || !ck(cudaGraphUpload(ple_g_, q0_), "PLE graph upload") || !ck(cudaStreamSynchronize(q0_), "PLE graph sync"))
++            return false;
++    }
++    s0.ple_in = ple_in_;
++    s0.ple_g = ple_g_;
++    if (!ck(cudaMemcpy(st0_, &s0, sizeof(St0), cudaMemcpyHostToDevice), "state 0 copy")) return false;
++    if (g0_ == nullptr && !ck(make_sched_graph(q0_, true, d_s0_, nullptr, ctl_dev_, st0_, &g0_), "scheduler 0 graph")) return false;
++    // GPU1: its stage and the drafter
++    if (!ck(cudaSetDevice(dev1_), "device 1")) return false;
++    if (d_s1_ == nullptr) {
++        if (!ck(cudaMalloc((void**) &d_s1_, sizeof(StageDesc)), "desc 1") || !ck(cudaMalloc((void**) &d_mtp_, sizeof(MtpDesc)), "desc mtp") ||
++            !ck(cudaMalloc(&st1_, sizeof(St1)), "state 1") || !ck(cudaStreamCreateWithFlags(&q1_, cudaStreamNonBlocking), "stream 1"))
++            return false;
++    }
++    if (!ck(cudaMemcpy(d_s1_, &a.s1, sizeof(StageDesc), cudaMemcpyHostToDevice), "desc 1 copy") ||
++        !ck(cudaMemcpy(d_mtp_, &a.mtp, sizeof(MtpDesc), cudaMemcpyHostToDevice), "desc mtp copy") ||
++        !ck(cudaMemcpy(st1_, &s1, sizeof(St1), cudaMemcpyHostToDevice), "state 1 copy"))
++        return false;
++    if (g1_ == nullptr && !ck(make_sched_graph(q1_, false, d_s1_, d_mtp_, ctl_dev_, st1_, &g1_), "scheduler 1 graph")) return false;
++    // go: GPU0 first (it waits for the first window)
++    if (!ck(cudaSetDevice(dev0_), "device 0") || !ck(cudaGraphLaunch(g0_, q0_), "scheduler 0 launch")) return false;
++    if (!ck(cudaSetDevice(dev1_), "device 1") || !ck(cudaGraphLaunch(g1_, q1_), "scheduler 1 launch")) return false;
++    return true;
++}
++
++bool Loop::wait(std::string& err) {
++    DevGuard guard;
++    cudaSetDevice(dev1_);
++    const cudaError_t e1 = cudaStreamSynchronize(q1_);
++    cudaSetDevice(dev0_);
++    const cudaError_t e0 = cudaStreamSynchronize(q0_);
++    if (e0 != cudaSuccess || e1 != cudaSuccess) {
++        err = std::string("blink: scheduler: ") + cudaGetErrorString(e0 != cudaSuccess ? e0 : e1);
++        return false;
++    }
++    return true;
++}
++
++}  // namespace strata::blink
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index d6d99e2..0e3b091 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1,4 +1,5 @@
+ // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
++#include "strata/core/blink.hpp"
+ #include "strata/core/mtp.hpp"
+ #include "strata/core/pin_budget.hpp"
+ #include "strata/kernels/qsa_prompt_attn.hpp"
+@@ -558,6 +559,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
+                      (double) vram_ / 1048576.0);
+     } else {
++        strata::blink::prepare_device(device_);   // Blink M2: before any capture of the drafter
+         std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+                      (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+                      (double) tensors_.back().off / 1048576.0, files_s,
+@@ -1411,6 +1413,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+ 
+ namespace {
+ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
++    if (ok) strata::blink::capture_done(cs);   // Blink M2: the loop's completion counter (no-op unless STRATA_BLINK=1)
+     cudaGraph_t graph = nullptr;
+     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+     if (!ok) {
+@@ -1418,7 +1421,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
+         return false;
+     }
+     cudaGraphExec_t got = nullptr;   // (a failed instantiate leaves nothing in the member)
+-    const cudaError_t ie = ce != cudaSuccess ? ce : cudaGraphInstantiate(&got, graph, 0);
++    const cudaError_t ie = ce != cudaSuccess ? ce : strata::blink::instantiate(&got, graph, 0);
+     if (ie != cudaSuccess) {
+         if (graph) cudaGraphDestroy(graph);
+         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ie);   // the status that failed
+@@ -1647,7 +1650,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+                 cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                                 cs_) != cudaSuccess ||
+-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
++                strata::blink::launch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
+                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1679,7 +1682,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
+         }
+         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                             cs_) != cudaSuccess ||
+-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
++            strata::blink::launch(prefill_exec_[T], cs_) != cudaSuccess ||
+             cudaStreamSynchronize(cs_) != cudaSuccess) {
+             err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+@@ -1795,12 +1798,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+ 
+     int n = 0;
+     if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (strata::blink::launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+         for (int j = 1; j < max_steps; ++j) {
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (strata::blink::launch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1836,7 +1839,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         if (dt) g_dt.pre_ms += hms(t0);
+         if (dt) cudaEventRecord(g_dt.eb[0], cs_);
+         Clock::time_point tl = Clock::now();
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (strata::blink::launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+@@ -1865,7 +1868,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : pj >= min_p); ++j) {
+             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
+             tl = Clock::now();
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (strata::blink::launch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1915,6 +1918,46 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+     return true;
+ }
+ 
++bool MtpDrafter::blink_desc(strata::blink::MtpDesc& d, std::string& err) {
++#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
++    (void) d;
++    err = "blink: CUDA only";
++    return false;
++#else
++    const OnDevice on_device(device_);
++    if (!decode_ready(err)) return false;
++    if (coupled_active_) { err = "blink: coupled draft sampling"; return false; }
++    if (chain_rule_) { err = "blink: a draft chain rule is set"; return false; }
++    if (chain_live_) { err = "blink: a pipelined chain is live"; return false; }
++    if (src_R_ != nullptr && src_R_ != window_R_) { err = "blink: the drafter stages its rows from another buffer"; return false; }
++    if (max_t_ < 1 || max_t_ > strata::blink::kMaxT) { err = "blink: drafter window out of range"; return false; }
++    for (int T = 1; T <= max_t_; ++T)
++        if (!capture_round(T, false, err) || round_exec_[T] == nullptr) { if (err.empty()) err = "blink: a round graph is missing"; return false; }
++    for (int j = 1; j <= max_t_ - 2; ++j)
++        if (!capture_step(j, false, err) || step_exec_[j] == nullptr) { if (err.empty()) err = "blink: a step graph is missing"; return false; }
++    unsigned long long fl = 0;
++    if (cudaGraphExecGetFlags(round_exec_[1], &fl) != cudaSuccess || (fl & cudaGraphInstantiateFlagDeviceLaunch) == 0) {
++        (void) cudaGetLastError();
++        err = "blink: the drafter graphs were not instantiated for device launch";
++        return false;
++    }
++    d = strata::blink::MtpDesc{};
++    d.tok = m_tok_; d.step = m_step_; d.pos = m_pos_; d.out = m_out_; d.row = m_row_; d.force = m_force_; d.prob = m_prob_;
++    d.n_head = (int) g_->n_head;
++    d.max_t = max_t_;
++    d.max_drafts = max_drafts_;
++    d.catchup_all = mtp_catchup_all() ? 1 : 0;
++    d.max_cells = (long long) st_.max_cells;
++    for (int T = 1; T <= max_t_; ++T) d.round[T] = round_exec_[T];
++    for (int j = 1; j <= max_t_ - 2; ++j) d.step_g[j] = step_exec_[j];
++    d.done = strata::blink::done_counter(device_);
++    d.device = device_;
++    if (d.done == nullptr) { err = "blink: no completion counter"; return false; }
++    if (d.tok == nullptr || d.out == nullptr || d.prob == nullptr || d.row == nullptr) { err = "blink: drafter buffers missing"; return false; }
++    return true;
++#endif
++}
++
+ bool MtpDrafter::draft_long(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                             float* probs, float min_p, int* n_drafts, DraftResult* result) {
+     if (T < 1 || T > strata::kernels::kVerifyLongT || a < 0 || a >= T) {
+@@ -2002,10 +2045,10 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!stage_source_R(T, err)) return false;
+     chain_early_ = std::max(0, std::min(n_early, n_out));
+-    bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
++    bool ok = strata::blink::launch(round_exec_[T], cs_) == cudaSuccess;
+     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
+     for (int j = 1; ok && j < n_out; ++j) {
+-        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
++        ok = strata::blink::launch(step_exec_[j], cs_) == cudaSuccess;
+         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
+     }
+     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 3f1bacd..e119a9b 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -10,6 +10,7 @@
+ #include "strata/core/defaults_026.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/blink.hpp"
+ #include "strata/core/window_evict.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/pin_budget.hpp"
+@@ -1330,6 +1331,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         }
+         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+     }
++    strata::blink::prepare_device(device_);   // Blink M2: before any capture of this stage
+     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
+                  (double) count.used / 1048576.0,
+                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
+@@ -2782,6 +2784,7 @@ bool Verifier::capture(int T, std::string& err) {
+ #endif
+     std::string rerr;
+     const bool ok = record_window(T, cs_, rerr);
++    if (ok) strata::blink::capture_done(cs_);   // Blink M2: the loop's completion counter (no-op unless STRATA_BLINK=1)
+     cudaGraph_t graph = nullptr;
+     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+     if (!ok) {
+@@ -3047,6 +3050,7 @@ bool Verifier::capture_commit(std::string& err) {
+         err = std::string("verify commit: ") + e.what();
+         ok = false;
+     }
++    if (ok) strata::blink::capture_done(cs_);   // Blink M2
+     cudaGraph_t graph = nullptr;
+     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+     if (!ok) {
+@@ -3096,6 +3100,162 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
+     staged_ = true;
+ }
+ 
++bool Verifier::blink_desc(strata::blink::StageDesc& d, int max_T, std::string& err) {
++#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
++    (void) d; (void) max_T;
++    err = "blink: CUDA only";
++    return false;
++#else
++    using namespace strata::kernels;
++    const OnDevice on_device(device_);
++    refresh_ar();
++    if (!all_resident_ || ar_off_) { err = "blink: this stage does not run the zero-doorbell all-resident graph"; return false; }
++    if (select_long_on()) { err = "blink: STRATA_SELECT_LONG is on"; return false; }
++    if (max_T < 1 || max_T > max_t_ || max_T > strata::blink::kMaxT || max_t_ > strata::blink::kMaxT) {
++        err = "blink: window size out of range";
++        return false;
++    }
++    sel_long_ = 0;
++    for (int T = 1; T <= max_T; ++T) {
++        if (!capture(T, err) || exec_[0][T] == nullptr) { if (err.empty()) err = "blink: a window graph is missing"; return false; }
++        if (groups_[T] > 1) { err = "blink: split token groups"; return false; }   // (set by the capture)
++    }
++    if (!capture_commit(err) || commit_exec_ == nullptr) { if (err.empty()) err = "blink: the commit graph is missing"; return false; }
++    unsigned long long fl = 0;
++    if (cudaGraphExecGetFlags(exec_[0][1], &fl) != cudaSuccess || (fl & cudaGraphInstantiateFlagDeviceLaunch) == 0) {
++        (void) cudaGetLastError();
++        err = "blink: the window graphs were not instantiated for device launch";
++        return false;
++    }
++    const ModelGeometry& g = *g_;
++    const QsaShapes s = shapes_of(g);
++    d = strata::blink::StageDesc{};
++    d.tok = m_tok_; d.step = m_step_; d.pos = m_pos_;
++    d.seq = m_seq_; d.flag = m_flag_; d.flagA = m_flagA_; d.flagB = m_flagB_;
++    d.hflag_out = hflag_out_h_; d.herr = herr_h_; d.hdrop = hdrop_h_;   // mapped (UVA: the host address is the device's)
++    d.commit = m_commit_;
++    d.out = last_stage() ? m_out_ : nullptr;
++    d.nf = (nan_guard_on() && last_stage() && m_nf_ != nullptr) ? m_nf_ : nullptr;
++    d.nf_blocks = kNonfiniteBlocks;
++    d.plan_err = m_plan_err_;
++    d.n_head = (int) g.n_head; d.n_head_kv = (int) g.n_head_kv; d.idx_q_heads = (int) g.idx_q_heads;
++    d.idx_block = (int) s.idx_block; d.idx_top_k = (int) s.idx_top_k; d.max_t = max_t_;
++    d.self_commit_t1 = (!always_publish_ && one_token_self_commit() && !g_qfuse()) ? 1 : 0;
++    for (int T = 1; T <= max_T; ++T) d.win[T] = exec_[0][T];
++    d.commit_exec = commit_exec_;
++    if (last_stage() && head_sampling_) {
++        const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
++        if (sampled) { err = "blink: a sampled request"; return false; }
++        if (sampling_.logit_bias != nullptr) { err = "blink: a logit bias"; return false; }
++        if (hist_d_ != nullptr) {
++            if (hist_len_ < 1 || hist_len_ > strata::blink::kPenCap) { err = "blink: penalty window out of range"; return false; }
++            const bool same = blink_samp_key_.h == hist_d_ && blink_samp_key_.n == hist_len_ &&
++                              blink_samp_key_.last_n == sampling_.penalty_last_n && blink_samp_key_.rep == sampling_.penalty_repeat &&
++                              blink_samp_key_.freq == sampling_.penalty_freq && blink_samp_key_.pres == sampling_.penalty_present;
++            if (!same) {   // another request's penalties: the pick is captured again (its parameters are baked in)
++                for (auto& x : blink_samp_) if (x != nullptr) { cudaGraphExecDestroy(x); x = nullptr; }
++                blink_samp_key_.h = hist_d_; blink_samp_key_.n = hist_len_; blink_samp_key_.last_n = sampling_.penalty_last_n;
++                blink_samp_key_.rep = sampling_.penalty_repeat; blink_samp_key_.freq = sampling_.penalty_freq;
++                blink_samp_key_.pres = sampling_.penalty_present;
++            }
++            for (int T = 1; T <= max_T; ++T) {
++                if (blink_samp_[T] == nullptr) {
++                    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "blink: begin pick capture"; return false; }
++                    SamplerParams sp = sampling_;
++                    sp.counter = 0;   // greedy: the pick reads no draw
++                    sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
++                    strata::blink::capture_done(cs_);
++                    cudaGraph_t graph = nullptr;
++                    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
++                    if (ce != cudaSuccess) { err = std::string("blink: pick capture: ") + cudaGetErrorString(ce); return false; }
++                    const cudaError_t ie = strata::blink::instantiate(&blink_samp_[T], graph, 0);
++                    cudaGraphDestroy(graph);
++                    if (ie != cudaSuccess) { blink_samp_[T] = nullptr; err = std::string("blink: pick instantiate: ") + cudaGetErrorString(ie); return false; }
++                    (void) cudaGraphUpload(blink_samp_[T], cs_);
++                }
++                d.samp[T] = blink_samp_[T];
++            }
++            d.hist = const_cast<int32_t*>(hist_d_);
++            d.hist_len = hist_len_;
++            (void) cudaStreamSynchronize(cs_);
++        }
++    }
++    d.done = strata::blink::done_counter(device_);
++    d.device = device_;
++    // the first stage's PLE rows: on the device (M3) when the table is in memory, IQ4_NL, and registered for the GPUs
++    static_assert(NGRAM_SIZE == 3 && PLE_N_HEADS == 16 && PLE_HEAD_DIM == 160 && PLE_ROW_BYTES == 90 && PLE_EOS_TOKEN_ID == 248044,
++                  "the device PLE gather (blink.cu) assumes this table geometry");
++    d.ple_mode = 0;
++    if (ple_stage() && ss_ != nullptr && ss_->ple.ready()) {
++        d.ple_mode = 1;
++        const char* pm = std::getenv("STRATA_BLINK_PLE");
++        const bool want_dev = pm == nullptr || std::strcmp(pm, "host") != 0;
++        const uint8_t* rows = ss_->ple.table != nullptr ? ss_->ple.table->mapped_rows() : nullptr;
++        const char* why = nullptr;
++        if (!want_dev) why = "STRATA_BLINK_PLE=host";
++        else if (rows == nullptr) why = "the table is read from the SSD (--ple-io ram or mmap keeps it in memory)";
++        else if (!ss_->ple.table->is_iq4nl()) why = "the table is not IQ4_NL";
++        if (why == nullptr) {
++            const uint64_t nr = ss_->ple.table->rows();
++            const void* dt = strata::blink::register_table(rows, (size_t) nr * PLE_ROW_BYTES);
++            if (dt == nullptr) why = "the table could not be registered for the GPUs";
++            else {
++                d.ple_mode = 2;
++                d.ple_table = (const uint8_t*) dt;
++                d.ple_rows = nr;
++                d.ple_out = m_ple_;
++                for (int i = 0; i < NGRAM_SIZE; ++i) d.ple_mult[i] = ss_->ple.consts.mult[i];
++                for (int h = 0; h < PLE_N_HEADS; ++h) { d.ple_vocab[h] = ss_->ple.consts.vocab[h]; d.ple_offset[h] = ss_->ple.consts.offset[h]; }
++            }
++        }
++        static bool said = false;
++        if (!said) {
++            said = true;
++            if (why) std::fprintf(stderr, "strata blink: the PLE rows are gathered by the host (M2): %s\n", why);
++            else std::fprintf(stderr, "strata blink: the PLE rows are gathered on the GPU (M3)\n");
++        }
++    }
++    if (d.done == nullptr) { err = "blink: no completion counter"; return false; }
++    if (last_stage() && d.out == nullptr) { err = "blink: no output rows"; return false; }
++    return true;
++#endif
++}
++
++bool Verifier::blink_ple_serve(const int32_t* tokens, int T, const int32_t* prev, std::string& err) {
++    using namespace strata::kernels;
++    SessionState& ss = *ss_;
++    if (ss.ple.ready() && ple_stage()) {
++        uint32_t ple_rows[kVerifyLongT * PLE_N_HEADS];
++        int32_t pv[2] = {prev[0], prev[1]};
++        for (int t = 0; t < T; ++t) {   // as run(): the rows from each token and the two before it
++            ngram_rows(&tokens[t], pv, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
++            pv[0] = pv[1];
++            pv[1] = tokens[t];
++            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
++        }
++        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        strata_store_fence();
++    }
++    *(volatile uint32_t*) h_flag_ = 1;
++    return true;
++}
++
++void Verifier::blink_after(int last_T, int64_t last_pos0, const int32_t* last_tokens, int64_t n_windows, const int32_t* ple_prev) {
++    last_t_ = last_T;
++    last_pos0_ = last_pos0;
++    for (int t = 0; t < last_T && t < max_t_; ++t) last_tokens_[t] = last_tokens[t];
++    windows += n_windows;
++    staged_ = false;
++    nf_row_ = -1;
++    nf_pos_ = -1;
++    nf_mask_ = 0;
++    if (ple_prev != nullptr && ple_stage()) {
++        ss_->ple_prev[0] = ple_prev[0];
++        ss_->ple_prev[1] = ple_prev[1];
++    }
++}
++
+ void Verifier::collect_profile() {
+     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+     accumulate_profile(prof_h_.data());
+@@ -3230,7 +3390,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
+     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
++    const cudaError_t le = strata::blink::launch(exec_t, cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+@@ -3387,7 +3547,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         }
+ #else
+         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
++        const cudaError_t le = strata::blink::launch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+ #endif
+         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+         graph_launched = true;
+@@ -3920,7 +4080,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
+                              (long long) ct.n);
+         }
+         if (ct.on) cudaEventRecord(ct.b, cs_);
+-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
++        const cudaError_t le = strata::blink::launch(commit_exec_, cs_);
+         if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
+         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+@@ -4354,8 +4514,8 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
+     staging_deferred_ = false;
+     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
+     const auto key = bkey(rows, S, hbase);
+-    cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
+-    if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
++    cudaError_t le = strata::blink::launch(exec_bm_[key], cs_);
++    if (le == cudaSuccess) le = strata::blink::launch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     b_k_ = 0;
+@@ -4384,7 +4544,7 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
+         for (int64_t j = 0; j < max_t_; ++j) c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(it->second, cs_);
++    const cudaError_t le = strata::blink::launch(it->second, cs_);
+     if (le != cudaSuccess) { err = std::string("verify: deferred commit launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens), the accepted rows only
+@@ -4553,14 +4713,14 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
+     // capture() reads as "captured" when it is not null)
+     capture_oom_ = false;
+     cudaGraphExec_t got = nullptr;
+-    cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
++    cudaError_t ie = strata::blink::instantiate(&got, graph, flags);
+     int freed = 0;
+     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
+         (void) cudaGetLastError();
+         if (!evict_batch_graph(key, evicted, err)) return false;
+         if (evicted) {
+             ++freed;
+-            ie = cudaGraphInstantiate(&got, graph, flags);
++            ie = strata::blink::instantiate(&got, graph, flags);
+         }
+     }
+     if (freed > 0)
+@@ -4573,7 +4733,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
+         if (!evict_window_graph(keep_t, evicted, err)) return false;
+         if (evicted) {
+             ++freed_sizes;
+-            ie = cudaGraphInstantiate(&got, graph, flags);
++            ie = strata::blink::instantiate(&got, graph, flags);
+         }
+     }
+     if (freed_sizes > 0)
+@@ -4728,7 +4888,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+     const ModelGeometry& g = *g_;
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+-    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
++    const cudaError_t le = strata::blink::launch(exec_bm_[bkey(rows, S, 0)], cs_);
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     volatile uint32_t* const seq = h_seq_;
+@@ -4861,7 +5021,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+     }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
+-        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
++        const cudaError_t le = strata::blink::launch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+         const cudaError_t se = cudaStreamSynchronize(cs_);
+         if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+@@ -4967,9 +5127,9 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
+     for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
++    cudaError_t le = strata::blink::launch(exec_bm_[bkey(rows, S, base)], cs_);
+     if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
++        le = strata::blink::launch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+@@ -5283,7 +5443,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+     ms_host += ms_since(t0);
+     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+-    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
++    const cudaError_t le = strata::blink::launch(exec_[sl][T], cs_);
+     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+@@ -5448,7 +5608,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+     h_commit_[1] = n_keep - 1;
+     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
++    const cudaError_t le = strata::blink::launch(commit_exec_, cs_);
+     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+     if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+     (void) cudaStreamQuery(cs_);
+diff --git a/src/kernels/ngram.cpp b/src/kernels/ngram.cpp
+index f961f6c..f738a5f 100644
+--- a/src/kernels/ngram.cpp
++++ b/src/kernels/ngram.cpp
+@@ -756,6 +756,8 @@ bool PleTable::gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t*
+ }
+ 
+ void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
++const uint8_t* PleTable::mapped_rows() const { return impl_->mode == PleIo::Direct ? nullptr : impl_->data; }
++bool PleTable::is_iq4nl() const { return impl_->fmt->id == PleFormat::IQ4_NL && impl_->rb == PLE_ROW_BYTES; }
+ 
+ std::string PleTable::io_report() const {
+     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 76ea523..edf04c3 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1,3 +1,4 @@
++#include "strata/core/blink.hpp"
+ #include "strata/core/logit_bias.hpp"
+ // src/program/generate.cpp - P2.S6: `strata generate`.
+ //
+@@ -20299,7 +20300,182 @@ int main(int argc, char** argv) {
+             auto draft_df2 = [&](int) -> bool { return false; };
+ #endif
+             if (df2_trace != nullptr) std::fprintf(df2_trace, "# request prompt %lld df2 %d spec %d\n", (long long) n, req_df2 ? 1 : 0, S_mtp);
+-            while (!pl_ran && !cancelled && produced_n < cap_now()) {
++            // ======== Blink M2 (STRATA_BLINK=1, strata/core/blink.hpp): the decode loop on the GPUs ========
++            // Taken only where the device loop reproduces this host loop token for token: a two-GPU layer split whose stages
++            // run their zero-doorbell graphs, plain greedy, the MTP drafter with --spec-min-p, no lookup drafts, no hold.
++            bool blink_ran = false;
++            if (strata::blink::loop_on() && !pl_ran && !cancelled && produced_n < cap_now()) {
++                std::string berr;
++                const char* why = nullptr;
++                if (n_stages != 2 || split_same) why = "not a two-GPU layer split";
++                else if (pipe) why = "--pipeline-windows";
++                else if (!use_mtp || !draft_on || req_df2 || use_df2) why = "the MTP layer is not the drafter";
++                else if (gated_proposal || mtp.prob() || mtp.coupled()) why = "sampled or gated drafts";
++                else if (sfx_on) why = "lookup drafts (--suffix-draft 0 and no --lookup-chain needed)";
++                else if (dc_learning || spec_cost) why = "the draft policy learns or prices the windows";
++                else if (merge_T > 0) why = "a merged first window";
++                else if (hold_on) why = "a thinking hold";
++                else if (!stop_bound) why = "STRATA_SERVE_STOP_BOUND=0";
++                else if (!req_sp.greedy) why = "sampled (temperature > 0)";
++                else if (hist_n > strata::blink::kPenCap) why = "a penalty window longer than the loop keeps";
++                else if (!req_bias.empty()) why = "a logit bias";
++                else if (!req_allowed.empty()) why = "an allowed-token list";
++                else if (req_logprobs >= 0) why = "logprobs";
++                else if (fol != nullptr) why = "STRATA_FOLLOW";
++                else if (!drive.d.usage.empty() || ajob) why = "the adaptive expert tier is on";
++                else if (req_spec_min_p <= 0.0) why = "--spec-min-p 0";
++                else if (S_mtp > strata::blink::kMaxT || (int64_t) o.eos_ids.size() > strata::blink::kMaxEos) why = "out of range";
++                strata::blink::LoopArgs la;
++                if (why == nullptr) {
++                    const int64_t need = std::min<int64_t>(o.max_context, p + (cap_now() - produced_n) + 2 * (int64_t) S + 64);
++                    if (kvg.on && need > kvg.cells && !kvg_ensure(need, adapt_quiesce)) why = "the K/V cannot grow for the whole request";
++                }
++                if (why == nullptr &&
++                    (!ver.blink_desc(la.s0, S_mtp, berr) || !stage_ver(1).blink_desc(la.s1, S_mtp, berr) || !mtp.blink_desc(la.mtp, berr)))
++                    why = berr.c_str();
++                if (why == nullptr && (la.s0.device < 0 || la.s1.device < 0 || la.mtp.device != la.s1.device))
++                    why = "the drafter is not on the last stage's GPU";
++                if (why != nullptr) {
++                    static std::set<std::string> said;
++                    if (said.insert(why).second) std::fprintf(stderr, "strata blink: this request decodes on the host loop: %s\n", why);
++                } else {
++                    la.dev0 = la.s0.device;
++                    la.dev1 = la.s1.device;
++                    la.p0 = p;
++                    la.x0 = x;
++                    la.max_new = cap_now();
++                    la.produced0 = produced_n;
++                    la.max_context = o.max_context;
++                    la.S_mtp = S_mtp;
++                    la.first_window = first_window ? 1 : 0;
++                    la.min_p = (float) req_spec_min_p;
++                    la.n_eos = (int) o.eos_ids.size();
++                    for (int i = 0; i < la.n_eos; ++i) la.eos[i] = (int) o.eos_ids[(size_t) i];
++                    la.ple_prev[0] = ss.ple_prev[0];
++                    la.ple_prev[1] = ss.ple_prev[1];
++                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::blink::kMaxT; ++i) { la.drafts[i] = drafts[i]; la.dprob[i] = dprob[i]; }
++                    if (hist_n > 0) {   // the penalties' tail: what the state consumed since their window began (the last hist_n)
++                        const int64_t n_tail = (int64_t) consumed.size() - (int64_t) pen_gen0;
++                        const int64_t take = std::min<int64_t>(std::max<int64_t>(n_tail, 0), (int64_t) hist_n);
++                        la.pen_n = (int) take;
++                        for (int64_t i = 0; i < take; ++i) la.pen_tail[i] = consumed[(size_t) (n_tail - take + i) + pen_gen0];
++                    }
++                    static strata::blink::Loop bloop;
++                    static bool said_on = false;
++                    if (!said_on) {
++                        said_on = true;
++                        std::fprintf(stderr, "strata blink: decoding on the GPUs (GPU%d stage 0, GPU%d stage 1 + drafter), windows up to %d\n",
++                                     la.dev0, la.dev1, S_mtp);
++                    }
++                    if (!bloop.start(la, berr)) { std::printf("ERR %s\n", berr.c_str()); return 1; }
++                    strata::blink::Ctl* const C = bloop.ctl();
++                    auto vi = [](const int& f) { return *(const volatile int*) &f; };
++                    auto vl = [](const long long& f) { return *(const volatile long long*) &f; };
++                    int64_t printed = produced_n;
++                    std::vector<int32_t> emitted;
++                    int ple_done = 0;
++                    bool stop_sent = false;
++                    for (;;) {
++                        bool did = false;
++                        const int ps = vi(C->ple_seq);
++                        if (ps != ple_done) {   // M2: the first stage's PLE rows (its layer 1 waits for them)
++                            std::atomic_thread_fence(std::memory_order_seq_cst);
++                            const int T = vi(C->ple_T);
++                            int32_t tk[strata::blink::kMaxT];
++                            for (int i = 0; i < T && i < strata::blink::kMaxT; ++i) tk[i] = vi(C->ple_tokens[i]);
++                            const int32_t pv[2] = {vi(C->ple_prev[0]), vi(C->ple_prev[1])};
++                            if (!ver.blink_ple_serve(tk, T, pv, berr)) {
++                                std::fprintf(stderr, "strata blink: PLE rows: %s\n", berr.c_str());
++                                *(volatile int*) &C->err_where = 20;
++                                *(volatile int*) &C->err = -2;
++                            }
++                            ple_done = ps;
++                            did = true;
++                        }
++                        const int64_t prod = vl(C->produced);
++                        if (prod > printed) {
++                            std::atomic_thread_fence(std::memory_order_seq_cst);
++                            for (; printed < prod; ++printed) {
++                                const int y = vi(C->ring[printed % strata::blink::kRing]);
++                                std::printf("T %d\n", y);
++                                emitted.push_back((int32_t) y);
++                                strata::core::progress_beat();
++                            }
++                            *(volatile long long*) &C->consumed = printed;
++                            std::fflush(stdout);
++                            did = true;
++                        }
++                        if (!stop_sent && stop_req.load()) { *(volatile int*) &C->stop = 1; stop_sent = true; }
++                        if (vi(C->finished) != 0) {
++                            std::atomic_thread_fence(std::memory_order_seq_cst);
++                            const int64_t prod2 = vl(C->produced);
++                            for (; printed < prod2; ++printed) {
++                                const int y = vi(C->ring[printed % strata::blink::kRing]);
++                                std::printf("T %d\n", y);
++                                emitted.push_back((int32_t) y);
++                                strata::core::progress_beat();
++                            }
++                            std::fflush(stdout);
++                            break;
++                        }
++                        if (!did) {
++#if defined(__x86_64__) || defined(_M_X64)
++                            __builtin_ia32_pause();
++#endif
++                        }
++                    }
++                    if (!bloop.wait(berr)) { std::printf("ERR %s\n", berr.c_str()); return 1; }
++                    const int fin = vi(C->finished);
++                    if (vi(C->err) != 0 || fin == strata::blink::kError) {
++                        const int e = vi(C->err);
++                        std::fprintf(stderr, "strata blink: the GPU loop failed (where %d): %s\n", vi(C->err_where),
++                                     e > 0 ? cudaGetErrorString((cudaError_t) e) : "see above");
++                        std::printf("ERR the GPU decode loop failed\n");
++                        return 1;
++                    }
++                    // the host state this loop would have left: the tokens fed (each window's x and its kept drafts: the first x,
++                    // then every emitted token but the last), the position, the counters, the stages' bookkeeping
++                    const int64_t nwin = vl(C->windows);
++                    const int64_t done_windows = nwin - (fin == strata::blink::kNonfinite ? 1 : 0);
++                    if (done_windows > 0 && !emitted.empty()) {
++                        consumed.push_back(x);
++                        for (size_t i = 0; i + 1 < emitted.size(); ++i) consumed.push_back(emitted[i]);
++                    }
++                    produced_n = printed;
++                    p = vl(C->p_end);
++                    x = vi(C->x_end);
++                    if (nwin > 0) first_window = false;
++                    draft_offered += vl(C->offered);
++                    draft_accepted += vl(C->accepted);
++                    rounds += nwin;
++                    dec_windows += nwin;
++                    dec_T += vl(C->offered) + nwin;
++                    int32_t lw[strata::blink::kMaxT];
++                    const int lT = vi(C->last_T);
++                    for (int i = 0; i < lT && i < strata::blink::kMaxT; ++i) lw[i] = vi(C->last_window[i]);
++                    const int32_t pe[2] = {vi(C->ple_prev_end[0]), vi(C->ple_prev_end[1])};
++                    if (nwin > 0) {
++                        ver.blink_after(lT, vl(C->last_p), lw, nwin, pe);
++                        stage_ver(1).blink_after(lT, vl(C->last_p), lw, nwin, nullptr);
++                        mtp.blink_after(nwin);
++                    }
++                    finish = fin == strata::blink::kStop ? "stop" : fin == strata::blink::kCancel ? "cancel"
++                           : fin == strata::blink::kNonfinite ? "nonfinite" : "length";
++                    if (fin == strata::blink::kNonfinite) {
++                        std::fprintf(stderr, "strata serve: non-finite logits (#879) in a decode window at position %lld: its tokens are "
++                                             "not emitted, the request ends (DONE nonfinite)\n", (long long) vl(C->last_p));
++                        nf_hit = true;
++                        nan_flush = true;
++                    }
++                    static int64_t said_n = 0;
++                    if (said_n++ < 3 || std::getenv("STRATA_BLINK_TRACE") != nullptr)
++                        std::fprintf(stderr, "strata blink: %lld windows, %lld tokens, device launches %lld + %lld, tail relaunches %lld + %lld\n",
++                                     (long long) nwin, (long long) (printed - la.produced0), (long long) vl(C->launches0),
++                                     (long long) vl(C->launches1), (long long) vl(C->relaunches0), (long long) vl(C->relaunches1));
++                    blink_ran = true;
++                }
++            }
++            while (!blink_ran && !pl_ran && !cancelled && produced_n < cap_now()) {
+                 int T = 1;
+                 policy.set_context(p);
+                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token

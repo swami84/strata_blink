@@ -1,0 +1,121 @@
+Strata 0.2.15, QFN, 2x RTX 3090 @300 W; decode suite (prose/code/json x reps, 1024 tokens); warm-ups excluded.
+stress: 16 unpinned threads (probe/stress); *-pinned: engine on cores 0-3, 8 stress threads pinned to cores 4-7.
+
+== chat
+                           isolated     stress      ratio
+decode tok/s (client)         159.1       46.1      0.29x
+ms / window                   17.92      64.58      3.60x
+tokens / window                2.86       2.83      0.99x
+  verify                      16.08      56.03      3.48x
+    per-layer host             0.21       5.73     27.30x
+    stage hand-off             0.01       1.09    108.83x
+  commit/emit                  0.30       4.00     13.17x
+  MTP draft                    1.52       4.04      2.65x
+  other                        0.01       0.22     33.00x
+CPU experts/layer-win          0.31       0.29      0.95x
+GPU waits on host flags        0.82      39.29     48.02x
+    s0 GDN waitA               0.09       4.47     49.65x
+    s0 GDN waitB               0.10       0.11      1.08x
+    s0 GDN waitCPU             0.06       3.48     59.63x
+    s0 QSA waitA               0.02       1.30     64.83x
+    s0 QSA waitCPU             0.02       1.01     60.80x
+    s1 GDN waitA               0.09       4.06     45.15x
+    s1 GDN waitB               0.12       0.11      0.94x
+    s1 GDN waitCPU             0.13      15.59    118.38x
+    s1 QSA waitA               0.04       1.84     45.92x
+    s1 QSA waitB               0.05       0.05      1.03x
+    s1 QSA waitCPU             0.06       7.22    131.36x
+   per-request tok/s isolated : [122, 126, 167, 173, 182, 185]
+   per-request tok/s stress   : [32, 45, 32, 51, 46, 70]
+
+== coder
+   graph: strata verify: window up to 6 tokens, 74.8 MiB of device buffers (100% VRAM resident: zero-doorbell graph)  (x1)
+                           isolated     stress      ratio
+decode tok/s (client)         133.7       62.1      0.46x
+ms / window                   20.66      45.18      2.19x
+tokens / window                2.79       2.79      1.00x
+  verify                      18.90      36.95      1.95x
+    per-layer host             0.00       0.00
+    stage hand-off             0.06       1.43     22.63x
+  commit/emit                  0.29       3.84     13.38x
+  MTP draft                    1.46       3.94      2.71x
+  other                        0.01       0.27     26.50x
+CPU experts/layer-win          0.03       0.03      1.00x
+GPU waits on host flags        0.55      13.99     25.29x
+    s1 GDN waitA               0.14       7.43     53.10x
+    s1 GDN waitB               0.15       0.16      1.08x
+    s1 GDN waitCPU             0.08       2.40     28.82x
+    s1 QSA waitA               0.05       2.89     57.80x
+    s1 QSA waitB               0.05       0.05      1.03x
+    s1 QSA waitCPU             0.03       1.00     33.44x
+   per-request tok/s isolated : [99, 100, 142, 155, 152, 154]
+   per-request tok/s stress   : [45, 44, 62, 70, 69, 84]
+
+== iq2xs
+   graph: strata verify: window up to 6 tokens, 57.2 MiB of device buffers (100% VRAM resident: zero-doorbell graph)  (x2)
+                           isolated     stress      ratio
+decode tok/s (client)         183.4      105.0      0.57x
+ms / window                   15.32      27.52      1.80x
+tokens / window                2.82       2.83      1.00x
+  verify                      13.77      20.93      1.52x
+    per-layer host             0.00       0.00
+    stage hand-off             0.07       1.37     18.73x
+  commit/emit                  0.29       3.72     12.99x
+  MTP draft                    1.27       2.67      2.10x
+  other                        0.00       0.20     58.50x
+CPU experts/layer-win          0.00       0.00
+GPU waits on host flags        0.05       0.05      1.03x
+   per-request tok/s isolated : [145, 139, 194, 209, 207, 206]
+   per-request tok/s stress   : [72, 67, 101, 119, 142, 130]
+
+== iq2xs-pin4-openstress
+   graph: strata verify: window up to 6 tokens, 57.2 MiB of device buffers (100% VRAM resident: zero-doorbell graph)  (x2)
+                           isolated     stress      ratio
+decode tok/s (client)         182.2      104.9      0.58x
+ms / window                   15.30      28.95      1.89x
+tokens / window                2.80       2.88      1.03x
+  verify                      13.74      22.13      1.61x
+    per-layer host             0.00       0.00
+    stage hand-off             0.09       1.94     22.78x
+  commit/emit                  0.29       3.81     13.31x
+  MTP draft                    1.26       2.80      2.22x
+  other                        0.01       0.20     30.50x
+CPU experts/layer-win          0.00       0.00
+GPU waits on host flags        0.05       0.05      1.00x
+   per-request tok/s isolated : [142, 146, 206, 189, 202, 208]
+   per-request tok/s stress   : [56, 59, 115, 135, 129, 136]
+
+== iq2xs-pin2-pinned
+   graph: strata verify: window up to 6 tokens, 57.2 MiB of device buffers (100% VRAM resident: zero-doorbell graph)  (x2)
+                           isolated     stress      ratio
+decode tok/s (client)         182.2      169.9      0.93x
+ms / window                   15.30      16.54      1.08x
+tokens / window                2.80       2.81      1.00x
+  verify                      13.75      14.39      1.05x
+    per-layer host             0.00       0.00
+    stage hand-off             0.09       0.39      4.18x
+  commit/emit                  0.28       0.60      2.11x
+  MTP draft                    1.26       1.50      1.19x
+  other                        0.00       0.04     13.50x
+CPU experts/layer-win          0.00       0.00
+GPU waits on host flags        0.05       0.05      1.00x
+   per-request tok/s isolated : [137, 141, 206, 194, 210, 206]
+   per-request tok/s stress   : [119, 128, 195, 187, 196, 196]
+
+== iq2xs-pinned
+   graph: strata verify: window up to 6 tokens, 57.2 MiB of device buffers (100% VRAM resident: zero-doorbell graph)  (x2)
+                           isolated     stress      ratio
+decode tok/s (client)         183.2      182.0      0.99x
+ms / window                   15.40      15.82      1.03x
+tokens / window                2.83       2.89      1.02x
+  verify                      13.84      14.14      1.02x
+    per-layer host             0.00       0.00
+    stage hand-off             0.09       0.11      1.23x
+  commit/emit                  0.28       0.33      1.15x
+  MTP draft                    1.27       1.32      1.04x
+  other                        0.00       0.03      8.50x
+CPU experts/layer-win          0.00       0.00
+GPU waits on host flags        0.05       0.05      1.00x
+   per-request tok/s isolated : [141, 143, 207, 194, 207, 207]
+   per-request tok/s stress   : [138, 141, 200, 206, 203, 204]
+

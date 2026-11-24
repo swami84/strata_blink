@@ -1,0 +1,11 @@
+# large or third-party, reproducible from the README
+strata-blink/
+vendor/
+paper.pdf
+logs/
+# build outputs
+probe/devlaunch
+probe/ffsync
+probe/xgpu
+probe/stress
+__pycache__/

@@ -1,0 +1,32 @@
+# NVIDIA GeForce RTX 3090 sm_86, 82 SMs | steps 20000, kernels/step 1, work/kernel 0 ns, stress threads 0
+mode          mean_us    p50_us    p99_us  p99.9_us    max_us   total_ms  check
+host-sync        8.22      6.72     15.34     17.83      51.3      164.3  ok
+host-async       1.75      2.12      2.38      5.37      11.8       36.8  ok  (per-step = host enqueue time; total includes the drain)
+dev-ff           3.87      4.10      4.10      8.19       8.2       77.4  ok  (166 window recoveries via tail launch)
+dev-tail         8.27      8.19      9.22      9.22       9.2      165.4  ok
+doorbell         1.62      2.05      2.05      2.05      17.4       32.5  ok  (one GPU->CPU->GPU round trip; host spins)
+
+# NVIDIA GeForce RTX 3090 sm_86, 82 SMs | steps 20000, kernels/step 1, work/kernel 0 ns, stress threads 16
+mode          mean_us    p50_us    p99_us  p99.9_us    max_us   total_ms  check
+host-sync       19.03     11.39     28.54   3102.32    6077.3      380.5  ok
+host-async       6.81      2.72     13.91   3019.26    3563.8      136.1  ok  (per-step = host enqueue time; total includes the drain)
+dev-ff           3.54      3.07      4.10      7.17      10.2       70.9  ok  (166 window recoveries via tail launch)
+dev-tail         7.89      8.19      8.19      8.19      22.5      157.9  ok
+doorbell         2.66      2.05      2.05     12.29    3033.1       53.9  ok  (one GPU->CPU->GPU round trip; host spins)
+
+# NVIDIA GeForce RTX 3090 sm_86, 82 SMs | steps 20000, kernels/step 48, work/kernel 0 ns, stress threads 0
+mode          mean_us    p50_us    p99_us  p99.9_us    max_us   total_ms  check
+host-sync       39.06     38.91     41.91     46.05     633.2      781.2  ok
+host-async      30.62     32.18     33.26     35.45     239.6      645.4  ok  (per-step = host enqueue time; total includes the drain)
+dev-ff          37.20     36.86     37.89     41.98      42.0      744.0  ok  (166 window recoveries via tail launch)
+dev-tail        38.77     38.91     38.91     38.91     181.2      775.5  ok
+doorbell         1.62      2.05      2.05      3.07      18.4       32.4  ok  (one GPU->CPU->GPU round trip; host spins)
+
+# NVIDIA GeForce RTX 3090 sm_86, 82 SMs | steps 20000, kernels/step 48, work/kernel 0 ns, stress threads 16
+mode          mean_us    p50_us    p99_us  p99.9_us    max_us   total_ms  check
+host-sync       78.80     45.37    192.60   4134.51    7050.0     1576.0  ok
+host-async      30.62     31.73     36.20   3539.67   14911.0      645.4  ok  (per-step = host enqueue time; total includes the drain)
+dev-ff          37.21     36.86     37.89     41.98      42.0      744.2  ok  (166 window recoveries via tail launch)
+dev-tail        38.77     38.91     38.91     38.91      46.1      776.4  ok
+doorbell         3.68      2.05      3.07     15.36    5055.5       78.6  ok  (one GPU->CPU->GPU round trip; host spins)
+

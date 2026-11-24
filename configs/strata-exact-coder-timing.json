@@ -1,0 +1,57 @@
+{
+ "exe": "/home/swamai/Work/experiments/basalt_vs_strata/engines/_strata-0.2.15-artifacts/engine/strata",
+ "args": [
+  "--pack",
+  "/home/swamai/Work/experiments/basalt_vs_strata/data/strata-data/packs/coder-iq1_m",
+  "--native",
+  "/home/swamai/Work/experiments/basalt_vs_strata/models/coder-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/home/swamai/Work/experiments/basalt_vs_strata/models/coder-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+  "--expert-profile",
+  "/home/swamai/Work/experiments/blink/vendor/strata-0.2.15/data/expert-profile-coder.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "/home/swamai/Work/experiments/basalt_vs_strata/data/strata-data/mtp/rt",
+  "--max-context",
+  "65536",
+  "--kv",
+  "int8",
+  "--kv-resident",
+  "32768"
+ ],
+ "cwd": "/home/swamai/Work/experiments/blink/vendor/strata-0.2.15",
+ "tokenizer": "/home/swamai/Work/experiments/basalt_vs_strata/data/strata-data/packs/coder-iq1_m/tokenizer",
+ "model_name": "qwen3.8-flash-next-coder-iq1_m",
+ "log": "/home/swamai/Work/experiments/blink/logs/engine-strata-exact-coder-timing.log",
+ "lib_dirs": [
+  "/home/swamai/opt/cuda-13.4.3/bin",
+  "/home/swamai/opt/cuda-13.4.3/lib64"
+ ],
+ "port": 8080,
+ "gpu": [
+  0,
+  1
+ ],
+ "gpus_asked": true,
+ "layer_split": "auto",
+ "open_browser": false,
+ "env": {
+  "STRATA_ROUTE_TAIL_SKIP": "0",
+  "STRATA_DECODE_TIMING": "1",
+  "STRATA_VERIFY_PROFILE": "1"
+ },
+ "_bench": {
+  "engine": "strata-0.2.15",
+  "variant": "exact-timing",
+  "model": "coder",
+  "server": "/home/swamai/Work/experiments/blink/vendor/strata-0.2.15/serve/server.py",
+  "python": "/home/swamai/Work/experiments/basalt_vs_strata/engines/Strata/terminal/.venv/bin/python"
+ }
+}

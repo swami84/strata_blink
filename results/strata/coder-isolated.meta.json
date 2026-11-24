@@ -1,0 +1,82 @@
+{
+ "engine": "strata-0.2.15",
+ "variant": "coder-isolated",
+ "url": "http://127.0.0.1:8080",
+ "model": "default",
+ "started": "2026-11-23T21:08:30",
+ "host": "SwamAI",
+ "gpus_idle": [
+  {
+   "idx": "0",
+   "mem_used_mib": "10105",
+   "mem_total_mib": "24576",
+   "util": "0",
+   "power_w": "120.93",
+   "sm_mhz": "1725",
+   "temp_c": "60",
+   "power_limit_w": "300.00",
+   "enforced_power_limit_w": "300.00",
+   "bus_id": "00000000:01:00.0"
+  },
+  {
+   "idx": "1",
+   "mem_used_mib": "23401",
+   "mem_total_mib": "24576",
+   "util": "0",
+   "power_w": "129.69",
+   "sm_mhz": "1965",
+   "temp_c": "44",
+   "power_limit_w": "300.00",
+   "enforced_power_limit_w": "300.00",
+   "bus_id": "00000000:03:00.0"
+  }
+ ],
+ "mem": {
+  "cpu_tctl_c": 62.125,
+  "MemTotal": 62344,
+  "MemAvailable": 24752,
+  "Cached": 26809,
+  "Unevictable": 0,
+  "Mlocked": 0
+ },
+ "notes": "blink applicability: isolated",
+ "gpus_loaded": [
+  {
+   "idx": "0",
+   "mem_used_mib": "10137",
+   "mem_total_mib": "24576",
+   "util": "15",
+   "power_w": "127.70",
+   "sm_mhz": "1725",
+   "temp_c": "61",
+   "power_limit_w": "300.00",
+   "enforced_power_limit_w": "300.00",
+   "bus_id": "00000000:01:00.0"
+  },
+  {
+   "idx": "1",
+   "mem_used_mib": "23489",
+   "mem_total_mib": "24576",
+   "util": "48",
+   "power_w": "167.50",
+   "sm_mhz": "1950",
+   "temp_c": "48",
+   "power_limit_w": "300.00",
+   "enforced_power_limit_w": "300.00",
+   "bus_id": "00000000:03:00.0"
+  }
+ ],
+ "mem_loaded": {
+  "cpu_tctl_c": 60.875,
+  "MemTotal": 62344,
+  "MemAvailable": 24309,
+  "Cached": 26241,
+  "Unevictable": 0,
+  "Mlocked": 0
+ },
+ "finished": "2026-11-23T21:09:21",
+ "calibration": {
+  "tokens_per_record": null,
+  "base": null
+ }
+}
